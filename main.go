@@ -507,6 +507,35 @@ func fastExtract(data []byte, key string) []byte {
 
 func fstr(data []byte, key string) string { return string(fastExtract(data, key)) }
 
+// lastStr returns the value of the LAST `"key":"value"` occurrence.
+// Use for __typename: nested objects serialize first, so the outer object's
+// own type tag is the last one. fstr (first match) returns a nested type
+// like "Proposal" instead of "SubmitRejected".
+func lastStr(data []byte, key string) string {
+	search := []byte(`"` + key + `":`)
+	idx := bytes.LastIndex(data, search)
+	if idx == -1 {
+		return ""
+	}
+	rest := data[idx+len(search):]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+	if len(rest) < 2 || rest[0] != '"' {
+		return ""
+	}
+	end := 1
+	for end < len(rest) {
+		if rest[end] == '\\' {
+			end += 2
+			continue
+		}
+		if rest[end] == '"' {
+			return string(rest[1:end])
+		}
+		end++
+	}
+	return ""
+}
+
 // ==========================================
 // UTILITIES
 // ==========================================
@@ -584,6 +613,11 @@ func extractCleanResponse(msg string) string {
 		return "UNKNOWN_ERROR"
 	}
 	upper := strings.ToUpper(msg)
+	// Any captcha-family signal normalizes to CAPTCHA_REQUIRED so the store
+	// is never dead-marked and the bot applies proxy cooldown (no poisoning).
+	if strings.Contains(upper, "CAPTCHA") {
+		return "CAPTCHA_REQUIRED"
+	}
 	dsIndicators := []string{"3DS_REQUIRED", "OTP", "SCA_REQUIRED", "AUTHENTICATION_REQUIRED", "THREE_D_SECURE", "OTP_REQUIRED", "THREE_DS_REDIRECT", "PAYMENTS_THREE_D_SECURE_REQUIRED"}
 	for _, ind := range dsIndicators {
 		if strings.Contains(upper, ind) {
@@ -1673,7 +1707,15 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		return res
 	}
 
+	// NOTE: read __typename off the submitForCompletion object — and take the
+	// LAST one: nested objects (buyerProposal…) serialize first, the outer
+	// SubmitRejected/Success tag sorts last. First-match yields "Proposal".
 	submitType := fstr(body, "__typename")
+	if _sfc := fastExtract(body, "submitForCompletion"); _sfc != nil {
+		if _t := lastStr(_sfc, "__typename"); _t != "" {
+			submitType = _t
+		}
+	}
 
 	for _rejTry := 0; _rejTry < 6 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
@@ -1777,11 +1819,37 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				return res
 			}
 			submitType = fstr(body, "__typename")
+			if _sfc := fastExtract(body, "submitForCompletion"); _sfc != nil {
+				if _t := lastStr(_sfc, "__typename"); _t != "" {
+					submitType = _t
+				}
+			}
 		}
 	}
 
 	if submitType == "SubmitSuccess" || submitType == "SubmittedForCompletion" || submitType == "SubmitAlreadyAccepted" {
-		receiptType := fstr(fastExtract(body, "receipt"), "__typename")
+		// SubmitSuccess sometimes arrives with errors attached but no receipt
+		// yet (terms accepted, receipt still materializing). Re-submit once
+		// with the SAME idempotent attemptToken after a short settle wait —
+		// safe by idempotency, surfaces the real receipt/verdict.
+		if _sfc0 := fastExtract(body, "submitForCompletion"); _sfc0 != nil && fastExtract(_sfc0, "receipt") == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(3 * time.Second):
+			}
+			submitPayload, _ = json.Marshal(map[string]interface{}{"query": MUTATION_SUBMIT, "variables": submitVars, "operationName": "SubmitForCompletion"})
+			if _rb, _, _rerr := doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload)); _rerr == nil && !isCaptchaRequired(_rb) {
+				body = _rb
+				if _sfc := fastExtract(body, "submitForCompletion"); _sfc != nil {
+					if _t := lastStr(_sfc, "__typename"); _t != "" {
+						submitType = _t
+					}
+				}
+			}
+		}
+	}
+	if submitType == "SubmitSuccess" || submitType == "SubmittedForCompletion" || submitType == "SubmitAlreadyAccepted" {
+		receiptType := lastStr(fastExtract(body, "receipt"), "__typename")
 		if receiptType == "ProcessedReceipt" {
 			res.Success = true
 			res.Message = "ORDER_PAID"
@@ -1855,7 +1923,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			return res
 		}
 
-		pollType := fstr(fastExtract(body, "receipt"), "__typename")
+		pollType := lastStr(fastExtract(body, "receipt"), "__typename")
 		lastTypename = pollType
 		if pollType == "ProcessedReceipt" {
 			res.Success = true
