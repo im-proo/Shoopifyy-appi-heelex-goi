@@ -58,6 +58,35 @@ type Address struct {
 	Address1, City, PostalCode, ZoneCode, CountryCode, Phone string
 }
 
+// dialCodes for E.164 phone normalization — strict stores reject local-format
+// numbers (DELIVERY_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN).
+var dialCodes = map[string]string{
+	"US": "1", "CA": "1", "GB": "44", "IN": "91", "AE": "971", "HK": "852",
+	"CN": "86", "CH": "41", "AU": "61", "DE": "49", "NZ": "64", "JP": "81",
+	"SG": "65", "SE": "46", "NO": "47", "DK": "45", "FR": "33", "MX": "52",
+	"BR": "55",
+}
+
+// normalizePhone converts Book phones to E.164 ("+<dial><digits>").
+func normalizePhone(raw, countryCode string) string {
+	digits := ""
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			digits += string(r)
+		}
+	}
+	if digits == "" {
+		return raw
+	}
+	if strings.HasPrefix(strings.TrimSpace(raw), "+") {
+		return "+" + digits
+	}
+	if d, ok := dialCodes[countryCode]; ok {
+		return "+" + d + digits
+	}
+	return "+" + digits
+}
+
 var Book = map[string]Address{
 	"US":      {"123 Main", "New York", "10080", "NY", "US", "2194157586"},
 	"CA":      {"88 Queen", "Toronto", "M5J2J3", "ON", "CA", "4165550198"},
@@ -1017,7 +1046,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 	fName, lName := getRandName()
 	email := genEmail(fName, lName)
-	phone := addr.Phone
+	phone := normalizePhone(addr.Phone, addr.CountryCode)
 
 	headers := map[string]string{
 		"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -1192,6 +1221,9 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			"address1": addr.Address1, "city": addr.City, "countryCode": addr.CountryCode,
 			"postalCode": addr.PostalCode, "firstName": fName, "lastName": lName,
 			"zoneCode": addr.ZoneCode, "phone": phone,
+			// DELIVERY_COMPANY_REQUIRED stores reject company-less
+			// addresses; residential pattern (name as company) is neutral.
+			"company": fName + " " + lName,
 		},
 	}
 
@@ -1468,6 +1500,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		transformerFP = tf
 	}
 
+	// Seller's presentment currency (filled inside refreshProposal) — if
+	// submit later fails with a currency-mismatch code, the retry loop
+	// re-aligns buyerIdentity + taxes to this.
+	sellerCurrency := ""
 	refreshProposal := func() {
 		if requiresShipping && deliveryStrategy != "" {
 			if dl, ok := variables["delivery"].(map[string]interface{}); ok {
@@ -1507,6 +1543,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			if pv, err := strconv.ParseFloat(tp, 64); err == nil {
 				res.Price = pv
 			}
+		}
+		// Seller's presentment currency — captured into outer sellerCurrency.
+		if sc := fstr(fastExtract(sellerBlock(body), "checkoutTotal"), "currencyCode"); sc != "" {
+			sellerCurrency = sc
 		}
 		if ta := fstr(fastExtract(sellerBlock(body), "tax"), "amount"); ta != "" {
 			taxAmount = ta
@@ -1744,6 +1784,21 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				if errs == nil {
 					break
 				}
+			}
+		}
+		// Currency mismatch: re-align buyer presentment + taxes to the
+		// seller's presentment currency captured at proposal stage.
+		// Reactive only — fires solely on mismatch codes.
+		for _, _c := range errCodes {
+			if (strings.Contains(_c, "PRESENTMENT_CURRENCY") || strings.Contains(_c, "CURRENCY_NOT_SUPPORTED")) && sellerCurrency != "" && sellerCurrency != currency {
+				currency = sellerCurrency
+				res.Currency = sellerCurrency
+				if _bi, ok := submitVars["input"].(map[string]interface{})["buyerIdentity"].(map[string]interface{}); ok {
+					if _cu, ok := _bi["customer"].(map[string]string); ok {
+						_cu["presentmentCurrency"] = sellerCurrency
+					}
+				}
+				break
 			}
 		}
 		if rejectNeedsTermAccept(errCodes) {
