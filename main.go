@@ -29,8 +29,10 @@ import (
 // ==========================================
 
 const (
-	PER_USER_CONCURRENT   = 500
-	GLOBAL_MAX_CONCURRENT = 1500
+	// Capped for a 2GB box: 1500/500 in-flight GraphQL checks ballooned to
+	// 471MB RSS and got OOM-killed mid-mass-check. 120/60 keeps RSS <150MB.
+	PER_USER_CONCURRENT   = 60
+	GLOBAL_MAX_CONCURRENT = 120
 	MAX_POLL_ATTEMPTS     = 8
 	POLL_INITIAL_DELAY    = 600 * time.Millisecond
 	POLL_MAX_DELAY        = 1200 * time.Millisecond
@@ -281,8 +283,8 @@ var GlobalClient *http.Client
 func init() {
 	GlobalClient = &http.Client{
 		Transport: &http.Transport{
-			MaxIdleConns:        10000,
-			MaxIdleConnsPerHost: 500,
+			MaxIdleConns:        400,
+			MaxIdleConnsPerHost: 60,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 5 * time.Second,
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
@@ -1717,7 +1719,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		}
 	}
 
-	for _rejTry := 0; _rejTry < 6 && submitType == "SubmitRejected"; _rejTry++ {
+	for _rejTry := 0; _rejTry < 4 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
 		errs := fastExtract(body, "errors")
 		if errs != nil {
