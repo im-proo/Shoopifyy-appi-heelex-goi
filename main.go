@@ -882,7 +882,7 @@ func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string
 
 const QUERY_PROPOSAL = `query Proposal($sessionInput:SessionTokenInput!,$queueToken:String,$checkpointData:String,$delivery:DeliveryTermsInput,$merchandise:MerchandiseTermInput,$payment:PaymentTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{delivery:$delivery,discounts:{lines:[],acceptUnexpectedDiscounts:true},payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,tip:$tip,note:$note,localizationExtension:$localizationExtension,nonNegotiableTerms:$nonNegotiableTerms,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties},checkpointData:$checkpointData,queueToken:$queueToken}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails __typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}fragment BuyerProposalDetails on Proposal{buyerIdentity{...on FilledBuyerIdentityTerms{email phone customer{...on CustomerProfile{email __typename}...on BusinessCustomerProfile{email __typename}__typename}__typename}__typename}merchandiseDiscount{...ProposalDiscountFragment __typename}deliveryDiscount{...ProposalDiscountFragment __typename}delivery{...ProposalDeliveryFragment __typename}merchandise{...on FilledMerchandiseTerms{taxesIncluded merchandiseLines{stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}lineComponentsSource lineComponents{...MerchandiseBundleLineComponent __typename}components{...MerchandiseLineComponentWithCapabilities __typename}legacyFee __typename}__typename}__typename}runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalTaxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}fragment ProposalDetails on Proposal{runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}subtotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deliveryExpectations{...on FilledDeliveryExpectationTerms{deliveryExpectations{deliveryStrategyHandle signedHandle __typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}scriptFingerprint{signature signatureUuid __typename}transformerFingerprintV2 delivery{...on FilledDeliveryTerms{deliveryLines{targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{handle amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}intermediateRates progressiveRatesEstimatedTimeUntilCompletion __typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}payment{...on FilledPaymentTerms{availablePaymentLines{paymentMethod{...on PaymentProvider{paymentMethodIdentifier name extensibilityDisplayName __typename}...on OffsiteProvider{paymentMethodIdentifier name __typename}...on CustomOnsiteProvider{paymentMethodIdentifier name __typename}...on CustomerCreditCardPaymentMethod{paymentMethodIdentifier __typename}...on PaypalBillingAgreementPaymentMethod{paymentMethodIdentifier __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}__typename}fragment ProposalDiscountFragment on DiscountTermsV2{__typename...on FilledDiscountTerms{acceptUnexpectedDiscounts lines{...DiscountLineDetailsFragment __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment DiscountLineDetailsFragment on DiscountLine{allocations{...on DiscountAllocatedAllocationSet{__typename allocations{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}target{index targetType stableId __typename}__typename}}__typename}discount{...DiscountDetailsFragment __typename}lineAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}fragment DiscountDetailsFragment on Discount{...on CustomDiscount{title description presentationLevel allocationMethod targetSelection targetType signature signatureUuid type value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on CodeDiscount{title code presentationLevel allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on DiscountCodeTrigger{code __typename}...on AutomaticDiscount{presentationLevel title allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}fragment ProposalDeliveryFragment on DeliveryTerms{__typename...on FilledDeliveryTerms{deliveryLines{destinationAddress{...on StreetAddress{handle __typename}...on Geolocation{__typename}...on PartialStreetAddress{__typename}__typename}targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}groupType selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{title handle __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment FilledMerchandiseLineTargetCollectionFragment on FilledMerchandiseLineTargetCollection{linesV2{...on MerchandiseLine{stableId merchandise{...DeliveryLineMerchandiseFragment __typename}__typename}...on MerchandiseBundleLineComponent{stableId merchandise{...DeliveryLineMerchandiseFragment __typename}__typename}...on MerchandiseLineComponentWithCapabilities{stableId merchandise{...DeliveryLineMerchandiseFragment __typename}__typename}__typename}__typename}fragment DeliveryLineMerchandiseFragment on ProposalMerchandise{...on SourceProvidedMerchandise{__typename requiresShipping}...on ProductVariantMerchandise{__typename requiresShipping}...on ContextualizedProductVariantMerchandise{__typename requiresShipping}...on MissingProductVariantMerchandise{__typename variantId}__typename}fragment SourceProvidedMerchandise on Merchandise{...on SourceProvidedMerchandise{__typename product{id title __typename}variantId title price{amount currencyCode __typename}}__typename}fragment ProductVariantMerchandiseDetails on ProductVariantMerchandise{id variantId title product{id __typename}requiresShipping __typename}fragment ContextualizedProductVariantMerchandiseDetails on ContextualizedProductVariantMerchandise{id variantId title sku price{amount currencyCode __typename}product{id __typename}requiresShipping __typename}fragment LineAllocationDetails on LineAllocation{stableId __typename}fragment MerchandiseBundleLineComponent on MerchandiseBundleLineComponent{__typename stableId __typename}fragment MerchandiseLineComponentWithCapabilities on MerchandiseLineComponentWithCapabilities{__typename stableId __typename}`
 
-const MUTATION_SUBMIT = `mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken analytics:$analytics){...on SubmitSuccess{receipt{...ReceiptDetails __typename}__typename}...on SubmitAlreadyAccepted{receipt{...ReceiptDetails __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails __typename}errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}...on SubmittedForCompletion{receipt{...ReceiptDetails __typename}__typename}__typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{__typename}__typename}__typename}__typename}fragment BuyerProposalDetails on Proposal{__typename}fragment ProposalDetails on Proposal{__typename}`
+const MUTATION_SUBMIT = `mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken analytics:$analytics){...on SubmitSuccess{receipt{...ReceiptDetails __typename}__typename}...on SubmitAlreadyAccepted{receipt{...ReceiptDetails __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}__typename}deliveryExpectations{...on FilledDeliveryExpectationTerms{deliveryExpectations{deliveryStrategyHandle signedHandle __typename}__typename}...on PendingTerms{pollDelay __typename}__typename}delivery{...on FilledDeliveryTerms{deliveryLines{selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}...on SubmittedForCompletion{receipt{...ReceiptDetails __typename}__typename}__typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{__typename}__typename}__typename}__typename}fragment BuyerProposalDetails on Proposal{__typename}fragment ProposalDetails on Proposal{__typename}`
 
 const QUERY_POLL = `query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){...ReceiptDetails __typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{__typename}__typename}__typename}__typename}`
 
@@ -1388,13 +1388,18 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 
 	taxAmount := "0"
+	// _taxFresh tracks whether taxAmount came from a detailed seller block
+	// (vs default/proposal guess) — fresh figures are safe to ACK with.
+	_taxFresh := false
 	taxObj := fastExtract(body, "tax")
 	if taxObj != nil {
 		if ta := fstr(taxObj, "amount"); ta != "" {
 			taxAmount = ta
+			_taxFresh = true
 		} else if tv := fastExtract(taxObj, "value"); tv != nil {
 			if ta := fstr(tv, "amount"); ta != "" {
 				taxAmount = ta
+				_taxFresh = true
 			}
 		}
 	}
@@ -1505,9 +1510,11 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		}
 		if ta := fstr(fastExtract(sellerBlock(body), "tax"), "amount"); ta != "" {
 			taxAmount = ta
+			_taxFresh = true
 		} else if tv := fastExtract(fastExtract(sellerBlock(body), "tax"), "value"); tv != nil {
 			if ta := fstr(tv, "amount"); ta != "" {
 				taxAmount = ta
+				_taxFresh = true
 			}
 		}
 		if sf := fastExtract(body, "scriptFingerprint"); sf != nil {
@@ -1718,9 +1725,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			submitType = _t
 		}
 	}
-	log.Printf("[DBG submit] base=%s bodylen=%d fstr=%q sfc=%v submitType=%q taxesInclBody=%q", baseURL, len(body), fstr(body, "__typename"), fastExtract(body, "submitForCompletion") != nil, submitType, fstr(body, "taxesIncluded"))
+	log.Printf("[DBG submit] cc=%s base=%s bodylen=%d fstr=%q sfc=%v submitType=%q taxesInclBody=%q", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, len(body), fstr(body, "__typename"), fastExtract(body, "submitForCompletion") != nil, submitType, fstr(body, "taxesIncluded"))
 
-	for _rejTry := 0; _rejTry < 4 && submitType == "SubmitRejected"; _rejTry++ {
+	_taxShape := "proposed"
+	for _rejTry, _topErr := 0, ""; _rejTry < 4 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
 		errs := fastExtract(body, "errors")
 		if errs != nil {
@@ -1745,6 +1753,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 			if ta := fstr(fastExtract(sellerRej, "tax"), "amount"); ta != "" {
 				taxAmount = ta
+				_taxFresh = true
 			}
 			if ds := fstr(fastExtract(sellerRej, "selectedDeliveryStrategy"), "handle"); ds != "" {
 				deliveryStrategy = ds
@@ -1801,22 +1810,21 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				}
 			}
 			if _incl {
-				// INCLUSIVITY error by definition demands concrete inclusive/
-				// duty totals — alternate both remedies across retries.
-				// Reactive only: first submit untouched, working stores safe.
-				if _rejTry%2 == 0 {
-					submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
-						"totalAmountIncludedInTarget": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
-					}
-				} else {
-					submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
-						"totalTaxAndDutyAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
-					}
-				}
+				// INCLUSIVITY: inclusive-target and duty-amount are NOT
+				// valid TaxTermInput fields (server rejects both) — omit
+				// taxes and let seller terms stand. Reactive only: first
+				// submit untouched, working stores safe.
+				delete(submitVars["input"].(map[string]interface{}), "taxes")
+				_taxShape = "omit"
+			} else if _taxShape == "omit" && !_taxFresh {
+				// Progressed under omission but no fresh tax figure was
+				// extracted — keep omitting, nothing concrete to ACK with.
+				delete(submitVars["input"].(map[string]interface{}), "taxes")
 			} else {
 				submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
 					"proposedTotalAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
 				}
+				_taxShape = "proposed"
 			}
 			submitVars["attemptToken"] = submitAttemptToken
 			// Pending terms compute async — give the backend time to settle
@@ -1834,21 +1842,31 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			case <-time.After(time.Duration(_waitMs) * time.Millisecond):
 			}
 			submitPayload, _ = json.Marshal(map[string]interface{}{"query": MUTATION_SUBMIT, "variables": submitVars, "operationName": "SubmitForCompletion"})
-			body, _, retryErr := doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload))
+			_rb, _, retryErr := doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload))
 			if retryErr != nil {
 				res.Message = "Submit failed"
 				return res
 			}
-			if isCaptchaRequired(body) {
+			if isCaptchaRequired(_rb) {
 				res.Message = "CAPTCHA_REQUIRED"
 				return res
 			}
-			submitType = fstr(body, "__typename")
-			if _sfc := fastExtract(body, "submitForCompletion"); _sfc != nil {
+			// Only adopt the resubmit response when it carries a negotiation
+			// payload. Top-level validation errors (e.g. unknown input field
+			// from a failed remedy) must NOT clobber body/submitType —
+			// otherwise the loop silently exits and reports a stale code.
+			if _sfc := fastExtract(_rb, "submitForCompletion"); _sfc != nil {
+				body = _rb
+				submitType = fstr(body, "__typename")
 				if _t := lastStr(_sfc, "__typename"); _t != "" {
 					submitType = _t
 				}
+			} else {
+				_topErr = extractCleanResponse(string(_rb))
 			}
+			_tb := fastExtract(sellerRej, "tax")
+			log.Printf("[DBG tax] cc=%s try=%d taxblk=%.300s", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), _rejTry, _tb)
+			log.Printf("[DBG retry] cc=%s try=%d codes=%q taxAmt=%q shape=%s newType=%q topErr=%q rblen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), _rejTry, errCodes, taxAmount, _taxShape, submitType, _topErr, len(body))
 		}
 	}
 
