@@ -686,7 +686,7 @@ func rejectNeedsTermAccept(codes []string) bool {
 		if strings.Contains(cu, "TAX_NEW_TAX") || strings.HasPrefix(cu, "DELIVERY") ||
 			cu == "WAITING_PENDING_TERMS" || cu == "ORDER_TOTAL_CHANGED" ||
 			cu == "PAYMENT_AMOUNT_CHANGED" || strings.Contains(cu, "MUST_BE_ACCEPTED") ||
-			strings.Contains(cu, "DETAIL_CHANGED") {
+			strings.Contains(cu, "DETAIL_CHANGED") || strings.Contains(cu, "INCLUSIVITY") {
 			return true
 		}
 	}
@@ -1718,6 +1718,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			submitType = _t
 		}
 	}
+	log.Printf("[DBG submit] base=%s bodylen=%d fstr=%q sfc=%v submitType=%q taxesInclBody=%q", baseURL, len(body), fstr(body, "__typename"), fastExtract(body, "submitForCompletion") != nil, submitType, fstr(body, "taxesIncluded"))
 
 	for _rejTry := 0; _rejTry < 4 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
@@ -1792,8 +1793,30 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			if transformerFP != "" {
 				submitVars["input"].(map[string]interface{})["transformerFingerprintV2"] = transformerFP
 			}
-			submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
-				"proposedTotalAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
+			_incl := false
+			for _, _c := range errCodes {
+				if strings.Contains(_c, "INCLUSIVITY") {
+					_incl = true
+					break
+				}
+			}
+			if _incl {
+				// INCLUSIVITY error by definition demands concrete inclusive/
+				// duty totals — alternate both remedies across retries.
+				// Reactive only: first submit untouched, working stores safe.
+				if _rejTry%2 == 0 {
+					submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
+						"totalAmountIncludedInTarget": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
+					}
+				} else {
+					submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
+						"totalTaxAndDutyAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
+					}
+				}
+			} else {
+				submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
+					"proposedTotalAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
+				}
 			}
 			submitVars["attemptToken"] = submitAttemptToken
 			// Pending terms compute async — give the backend time to settle
