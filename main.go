@@ -407,35 +407,79 @@ func parseProxy(raw string) (*url.URL, error) {
 		}
 	}
 	if !strings.Contains(raw, "://") {
-		// Space-separated formats first: "user pass host port" (bot DB format),
-		// "host port user pass", and "host port".
-		if fields := strings.Fields(raw); len(fields) == 4 {
-			if _, err := strconv.Atoi(fields[3]); err == nil {
-				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, fields[0], fields[1], fields[2], fields[3])
-			} else if _, err := strconv.Atoi(fields[1]); err == nil {
-				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, fields[2], fields[3], fields[0], fields[1])
+		// No scheme-authority yet: split credentials manually, then build
+		// via net/url so special chars in user/pass (% { } $ & @ :) are
+		// properly escaped instead of breaking url.Parse.
+		var user, pass, hostport string
+		rest := raw
+		if at := strings.LastIndex(rest, "@"); at != -1 {
+			// Already userinfo@host form (no scheme): split on LAST @ so
+			// passwords containing @ survive; user/pass on FIRST colon.
+			var creds string
+			creds, hostport = rest[:at], rest[at+1:]
+			if ci := strings.Index(creds, ":"); ci != -1 {
+				user, pass = creds[:ci], creds[ci+1:]
 			} else {
-				raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, fields[0], fields[1], fields[2], fields[3])
+				user = creds
 			}
-		} else if fields := strings.Fields(raw); len(fields) == 2 {
-			raw = scheme + "://" + fields[0] + ":" + fields[1]
-		} else {
-			parts := strings.Split(raw, ":")
-			switch len(parts) {
-			case 2:
-				raw = scheme + "://" + raw
-			case 4:
-				if _, err := strconv.Atoi(parts[1]); err == nil {
-					raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[2], parts[3], parts[0], parts[1])
-				} else {
-					raw = fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[0], parts[1], parts[2], parts[3])
-				}
-			default:
-				raw = scheme + "://" + raw
+			return buildProxyURL(scheme, user, pass, hostport)
+		}
+		if fields := strings.Fields(rest); len(fields) == 4 {
+			// Space-separated formats: "user pass host port" (bot DB
+			// format) or "host port user pass".
+			if _, err := strconv.Atoi(fields[3]); err == nil {
+				user, pass, hostport = fields[0], fields[1], fields[2]+":"+fields[3]
+			} else if _, err := strconv.Atoi(fields[1]); err == nil {
+				user, pass, hostport = fields[2], fields[3], fields[0]+":"+fields[1]
+			} else {
+				user, pass, hostport = fields[0], fields[1], fields[2]+":"+fields[3]
 			}
+			return buildProxyURL(scheme, user, pass, hostport)
+		} else if fields := strings.Fields(rest); len(fields) == 2 {
+			return buildProxyURL(scheme, "", "", fields[0]+":"+fields[1])
+		}
+		parts := strings.Split(rest, ":")
+		switch len(parts) {
+		case 2:
+			return buildProxyURL(scheme, "", "", rest)
+		case 4:
+			if _, err := strconv.Atoi(parts[1]); err == nil {
+				return buildProxyURL(scheme, parts[2], parts[3], parts[0]+":"+parts[1])
+			}
+			return buildProxyURL(scheme, parts[0], parts[1], parts[2]+":"+parts[3])
+		default:
+			return buildProxyURL(scheme, "", "", rest)
 		}
 	}
+	// Scheme-authority form (bot sends normalized http://user:pass@host:port):
+	// split userinfo on LAST @ / FIRST : manually for the same escaping
+	// reason, then rebuild. Falls back to plain parse when no userinfo.
+	rest := raw[strings.Index(raw, "://")+3:]
+	if at := strings.LastIndex(rest, "@"); at != -1 {
+		var user, pass string
+		creds, hostport := rest[:at], rest[at+1:]
+		if ci := strings.Index(creds, ":"); ci != -1 {
+			user, pass = creds[:ci], creds[ci+1:]
+		} else {
+			user = creds
+		}
+		return buildProxyURL(scheme, user, pass, hostport)
+	}
 	return url.Parse(raw)
+}
+
+// buildProxyURL constructs the proxy URL via net/url so credentials with
+// special characters are escaped (url.UserPassword handles % & $ { } @ :).
+func buildProxyURL(scheme, user, pass, hostport string) (*url.URL, error) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return nil, fmt.Errorf("invalid proxy format")
+	}
+	u := &url.URL{Scheme: scheme, Host: hostport}
+	if user != "" {
+		u.User = url.UserPassword(user, pass)
+	}
+	return u, nil
 }
 
 func doReq(ctx context.Context, client *http.Client, method, reqURL string, headers map[string]string, body io.Reader) ([]byte, int, error) {
@@ -1626,17 +1670,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		pciToken = fstr(body, "id")
 	}
 
-	// Fallback: if proxy blocked PCI domain, retry without proxy
-	if pciToken == "" && proxyStr != "" {
-		directClient, cerr := getProxyClient("")
-		if cerr == nil {
-			body, _, err = doReq(ctx, directClient, "POST", pciURL, pciHeaders, bytes.NewReader(pciPayload))
-			if err == nil {
-				pciToken = fstr(body, "id")
-			}
-		}
-	}
-
+	// NOTE: no direct (no-proxy) fallback here on purpose. A PCI token minted
+	// from our datacenter IP but submitted through the user's proxy (or vice
+	// versa) dies at submit with PAYMENTS_CREDIT_CARD_SESSION_ID — a full
+	// wasted cycle. Fail fast so the bot rotates site/proxy instead.
 	if pciToken == "" {
 		res.Message = "PCI_TOKEN_FAILED"
 		return res
