@@ -92,17 +92,69 @@ func randomizedPhones(addr Address) (string, string, string) {
 		return "", "", ""
 	}
 	gen := ""
-	for i := 0; i < n; i++ {
-		d := rand.Intn(10)
-		if i == 0 && d < 2 {
-			d = 2 + rand.Intn(8)
+	for _t := 0; _t < 25; _t++ {
+		gen = ""
+		for i := 0; i < n; i++ {
+			d := rand.Intn(10)
+			if i == 0 && d < 2 {
+				d = 2 + rand.Intn(8)
+			}
+			gen += string(rune('0' + d))
 		}
-		gen += string(rune('0' + d))
+		if plausibleNationalNumber(gen, addr.CountryCode) {
+			break
+		}
 	}
 	return "+" + dial + gen, gen, "+" + dial + " " + gen
 }
 
-// normalizePhone converts Book phones to E.164 ("+<dial><digits>").
+// plausibleNationalNumber rejects obviously-fake digit strings that strict
+// validators (libphonenumber validity, repeated/sequential checks) refuse:
+// NANP N11 rules for US/CA, 4+ repeats or 5+ runs anywhere.
+func plausibleNationalNumber(digits, country string) bool {
+	if digits == "" {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	run, up, down := 1, 1, 1
+	for i := 1; i < len(digits); i++ {
+		if digits[i] == digits[i-1] {
+			run++
+			if run >= 4 {
+				return false
+			}
+		} else {
+			run = 1
+		}
+		if digits[i] == digits[i-1]+1 {
+			up++
+			if up >= 5 {
+				return false
+			}
+		} else {
+			up = 1
+		}
+		if digits[i] == digits[i-1]-1 {
+			down++
+			if down >= 5 {
+				return false
+			}
+		} else {
+			down = 1
+		}
+	}
+	if (country == "US" || country == "CA") && len(digits) == 10 {
+		area, exch := digits[0:3], digits[3:6]
+		if area[0] < '2' || area[1:3] == "11" || exch[0] < '2' || exch[1:3] == "11" {
+			return false
+		}
+	}
+	return true
+}
 func normalizePhone(raw, countryCode string) string {
 	digits := ""
 	for _, r := range raw {
@@ -1153,12 +1205,18 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			return
 		}
 		_gen := ""
-		for _i := 0; _i < phoneNatLen; _i++ {
-			_dg := rand.Intn(10)
-			if _i == 0 && _dg < 2 {
-				_dg = 2 + rand.Intn(8)
+		for _t := 0; _t < 25; _t++ {
+			_gen = ""
+			for _i := 0; _i < phoneNatLen; _i++ {
+				_dg := rand.Intn(10)
+				if _i == 0 && _dg < 2 {
+					_dg = 2 + rand.Intn(8)
+				}
+				_gen += string(rune('0' + _dg))
 			}
-			_gen += string(rune('0' + _dg))
+			if plausibleNationalNumber(_gen, addr.CountryCode) {
+				break
+			}
 		}
 		phoneE164 = "+" + phoneDial + _gen
 		phoneLocal = _gen
