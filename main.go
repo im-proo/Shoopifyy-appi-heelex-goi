@@ -1805,6 +1805,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	log.Printf("[DBG submit] cc=%s base=%s bodylen=%d fstr=%q sfc=%v submitType=%q taxesInclBody=%q", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, len(body), fstr(body, "__typename"), fastExtract(body, "submitForCompletion") != nil, submitType, fstr(body, "taxesIncluded"))
 
 	_taxShape := "proposed"
+	_noStrategy := false
 	for _rejTry, _topErr := 0, ""; _rejTry < 4 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
 		errs := fastExtract(body, "errors")
@@ -1823,9 +1824,23 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				}
 			}
 		}
-		// Currency mismatch: re-align buyer presentment + taxes to the
-		// seller's presentment currency captured at proposal stage.
-		// Reactive only — fires solely on mismatch codes.
+		// Delivery-strategy rejected (conditions not satisfied / none
+		// available): drop our strategy selections + expectations and let
+		// seller defaults stand. Reactive only.
+		for _, _c := range errCodes {
+			if strings.Contains(_c, "STRATEGY_CONDITIONS") || strings.Contains(_c, "NO_DELIVERY_STRATEGY") {
+				_noStrategy = true
+				if _inMap, ok := submitVars["input"].(map[string]interface{}); ok {
+					if _dl, ok := _inMap["delivery"].(map[string]interface{}); ok {
+						if _lines, ok := _dl["deliveryLines"].([]map[string]interface{}); ok && len(_lines) > 0 {
+							delete(_lines[0], "selectedDeliveryStrategy")
+						}
+					}
+					delete(_inMap, "deliveryExpectations")
+				}
+				break
+			}
+		}
 		for _, _c := range errCodes {
 			if (strings.Contains(_c, "PRESENTMENT_CURRENCY") || strings.Contains(_c, "CURRENCY_NOT_SUPPORTED")) && sellerCurrency != "" && sellerCurrency != currency {
 				currency = sellerCurrency
@@ -1861,16 +1876,20 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 			dl := submitVars["input"].(map[string]interface{})["delivery"].(map[string]interface{})
 			if lines, ok := dl["deliveryLines"].([]map[string]interface{}); ok && len(lines) > 0 {
-				if deliveryStrategy != "" {
+				if deliveryStrategy != "" && !_noStrategy {
 					lines[0]["selectedDeliveryStrategy"] = map[string]interface{}{
 						"deliveryStrategyByHandle": map[string]interface{}{"handle": deliveryStrategy, "customDeliveryRate": false},
 						"options":                  map[string]string{"phone": phone},
 					}
+				} else if _noStrategy {
+					delete(lines[0], "selectedDeliveryStrategy")
 				}
 				lines[0]["expectedTotalPrice"] = map[string]interface{}{"any": true}
 				lines[0]["destinationChanged"] = false
 			}
-			if signedHandle != "" {
+			if _noStrategy {
+				delete(submitVars["input"].(map[string]interface{}), "deliveryExpectations")
+			} else if signedHandle != "" {
 				submitVars["input"].(map[string]interface{})["deliveryExpectations"] = map[string]interface{}{
 					"deliveryExpectationLines": []map[string]string{{"signedHandle": signedHandle}},
 				}
