@@ -1403,21 +1403,63 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 	// All available strategy handles — the submit loop cycles through these
 	// when the seller rejects our selected strategy (STRATEGY_CONDITIONS).
+	// Per item only the FIRST handle is the strategy's own (nested objects
+	// like brandedPromise carry their own handle fields).
 	_stratHandles := []string{}
 	_stratIdx := 0
-	if ab := fastExtract(sellerBlock(body), "availableDeliveryStrategies"); ab != nil {
-		_hre := regexp.MustCompile(`"handle"\s*:\s*"([^"]+)"`)
-		for _, _m := range _hre.FindAllSubmatch(ab, -1) {
-			_h := string(_m[1])
-			_dup := false
-			for _, _e := range _stratHandles {
-				if _e == _h {
-					_dup = true
-					break
+	if ab := fastExtract(sellerBlock(body), "availableDeliveryStrategies"); ab != nil && len(ab) > 2 {
+		inner := ab[1 : len(ab)-1]
+		depth, start, inStr := 0, 0, false
+		for i := 0; i < len(inner); i++ {
+			c := inner[i]
+			if inStr {
+				if c == '\\' {
+					i++
+				} else if c == '"' {
+					inStr = false
 				}
+				continue
 			}
-			if !_dup && _h != "" {
-				_stratHandles = append(_stratHandles, _h)
+			switch c {
+			case '"':
+				inStr = true
+			case '{', '[':
+				if depth == 0 {
+					start = i
+				}
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					item := inner[start : i+1]
+					if hi := bytes.Index(item, []byte(`"handle"`)); hi != -1 {
+						rest := item[hi+len(`"handle"`):]
+						rest = bytes.TrimLeft(rest, " \t\n\r:")
+						rest = bytes.TrimLeft(rest, " \t\n\r:")
+						if len(rest) > 0 && rest[0] == '"' {
+							end := 1
+							for end < len(rest) && rest[end] != '"' {
+								if rest[end] == '\\' {
+									end++
+								}
+								end++
+							}
+							if h := string(rest[1:end]); h != "" {
+								_dup := false
+								for _, _e := range _stratHandles {
+									if _e == h {
+										_dup = true
+										break
+									}
+								}
+								if !_dup {
+									_stratHandles = append(_stratHandles, h)
+								}
+							}
+						}
+					}
+				}
+			case ',':
 			}
 		}
 	}
@@ -1825,7 +1867,6 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	log.Printf("[DBG submit] cc=%s base=%s bodylen=%d fstr=%q sfc=%v submitType=%q taxesInclBody=%q", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, len(body), fstr(body, "__typename"), fastExtract(body, "submitForCompletion") != nil, submitType, fstr(body, "taxesIncluded"))
 
 	_taxShape := "proposed"
-	_noStrategy := false
 	_noPhone := false
 	_prevSig, _prevPrevSig := "", ""
 	for _rejTry, _topErr := 0, ""; _rejTry < 8 && submitType == "SubmitRejected"; _rejTry++ {
@@ -1854,9 +1895,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			break
 		}
 		_prevPrevSig, _prevSig = _prevSig, _sig
-		// Delivery-strategy rejected: cycle remaining seller handles first
-		// (explicit strategy preferred for shipping), drop selections when
-		// exhausted and let seller defaults stand. Reactive only.
+		// Delivery-strategy rejected: cycle the seller's remaining handles.
+		// (Deleting the selection is schema-invalid — non-nullable field.)
+		// Handles exhausted → resubmits repeat → stuck-break terminates.
+		// Reactive only.
 		for _, _c := range errCodes {
 			if strings.Contains(_c, "STRATEGY_CONDITIONS") || strings.Contains(_c, "NO_DELIVERY_STRATEGY") {
 				for _stratIdx < len(_stratHandles) && _stratHandles[_stratIdx] == deliveryStrategy {
@@ -1865,25 +1907,13 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				if _stratIdx < len(_stratHandles) {
 					deliveryStrategy = _stratHandles[_stratIdx]
 					_stratIdx++
-					_noStrategy = false
-				} else {
-					_noStrategy = true
-				}
-				if _noStrategy {
-					if _inMap, ok := submitVars["input"].(map[string]interface{}); ok {
-						if _dl, ok := _inMap["delivery"].(map[string]interface{}); ok {
-							if _lines, ok := _dl["deliveryLines"].([]map[string]interface{}); ok && len(_lines) > 0 {
-								delete(_lines[0], "selectedDeliveryStrategy")
-							}
-						}
-						delete(_inMap, "deliveryExpectations")
-					}
 				}
 				break
 			}
 		}
-		// Phone rejected: retry phoneless (stores that demand a phone emit a
-		// different code). One-way per check; harmless when unneeded.
+		// Phone pattern rejected → retry phoneless. Phone REQUIRED while
+		// phoneless → restore E.164 phone (flip-flop, one round-trip max:
+		// stuck-break ends it if the store keeps flapping).
 		for _, _c := range errCodes {
 			if strings.Contains(_c, "PHONE_NUMBER") && !_noPhone {
 				_noPhone = true
@@ -1900,6 +1930,13 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 							}
 						}
 					}
+				}
+				break
+			}
+			if strings.Contains(_c, "REQUIRED") && strings.Contains(_c, "PHONE") && _noPhone {
+				_noPhone = false
+				if _sa, ok := billingAddr["streetAddress"].(map[string]string); ok {
+					_sa["phone"] = phone
 				}
 				break
 			}
@@ -1939,7 +1976,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 			dl := submitVars["input"].(map[string]interface{})["delivery"].(map[string]interface{})
 			if lines, ok := dl["deliveryLines"].([]map[string]interface{}); ok && len(lines) > 0 {
-				if deliveryStrategy != "" && !_noStrategy {
+				if deliveryStrategy != "" {
 					_optPhone := phone
 					if _noPhone {
 						_optPhone = ""
@@ -1948,15 +1985,11 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 						"deliveryStrategyByHandle": map[string]interface{}{"handle": deliveryStrategy, "customDeliveryRate": false},
 						"options":                  map[string]string{"phone": _optPhone},
 					}
-				} else if _noStrategy {
-					delete(lines[0], "selectedDeliveryStrategy")
 				}
 				lines[0]["expectedTotalPrice"] = map[string]interface{}{"any": true}
 				lines[0]["destinationChanged"] = false
 			}
-			if _noStrategy {
-				delete(submitVars["input"].(map[string]interface{}), "deliveryExpectations")
-			} else if signedHandle != "" {
+			if signedHandle != "" {
 				submitVars["input"].(map[string]interface{})["deliveryExpectations"] = map[string]interface{}{
 					"deliveryExpectationLines": []map[string]string{{"signedHandle": signedHandle}},
 				}
@@ -2041,6 +2074,11 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				}
 			} else {
 				_topErr = extractCleanResponse(string(_rb))
+				_topMsg := fstr(_rb, "message")
+				if len(_topMsg) > 180 {
+					_topMsg = _topMsg[:180]
+				}
+				_topErr = _topErr + "::" + _topMsg
 			}
 			_tb := fastExtract(sellerRej, "tax")
 			log.Printf("[DBG tax] cc=%s try=%d taxblk=%.300s", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), _rejTry, _tb)
