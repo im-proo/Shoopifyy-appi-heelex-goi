@@ -954,7 +954,8 @@ func rejectNeedsTermAccept(codes []string) bool {
 		if strings.Contains(cu, "TAX_NEW_TAX") || strings.HasPrefix(cu, "DELIVERY") ||
 			cu == "WAITING_PENDING_TERMS" || cu == "ORDER_TOTAL_CHANGED" ||
 			cu == "PAYMENT_AMOUNT_CHANGED" || strings.Contains(cu, "MUST_BE_ACCEPTED") ||
-			strings.Contains(cu, "DETAIL_CHANGED") || strings.Contains(cu, "INCLUSIVITY") {
+			strings.Contains(cu, "DETAIL_CHANGED") || strings.Contains(cu, "INCLUSIVITY") ||
+			strings.Contains(cu, "TERMS_CHANGED") || cu == "PAYMENTS_METHOD" {
 			return true
 		}
 	}
@@ -2272,12 +2273,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				}
 			}
 		}
-		// Null-tax fast break: lone TAX_NEW_TAX with totalTaxAmount null
-		// means no figure exists to ACK with — terminal now, not after 8
-		// futile rounds (~60s burned per card otherwise).
+		// Null-tax TAX_NEW_TAX: seller publishes totalTaxAmount null, so no
+		// figure exists to ACK with — but an explicit zero proposal costs
+		// one submit and sometimes satisfies "concrete total" demands.
+		// (Omitting was already tried to reach this state.)
 		if len(errCodes) == 1 && errCodes[0] == "TAX_NEW_TAX_MUST_BE_ACCEPTED" {
 			if tb := fastExtract(sellerBlock(body), "tax"); tb != nil && bytes.Contains(tb, []byte(`"totalTaxAmount":null`)) {
-				break
+				taxAmount = "0"
+				_taxFresh = true
 			}
 		}
 		// Delivery-strategy rejected: cycle the seller's remaining handles.
