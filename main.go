@@ -1236,6 +1236,28 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 
 	atomic.AddInt64(&metrics.ActiveChecks, 1)
 	atomic.AddInt64(&metrics.TotalChecks, 1)
+
+	// CVV-length pre-validation: Amex (34/37) needs 4 digits, everything
+	// else 3. Mismatches are deterministic per card (every site rejects
+	// identically) — fail instantly instead of burning 15 sites × 60-90s.
+	_ccd := ""
+	for _, _r := range cc {
+		if _r >= '0' && _r <= '9' {
+			_ccd += string(_r)
+		}
+	}
+	_cvv := ""
+	for _, _r := range cvv {
+		if _r >= '0' && _r <= '9' {
+			_cvv += string(_r)
+		}
+	}
+	_isAmex := strings.HasPrefix(_ccd, "34") || strings.HasPrefix(_ccd, "37")
+	if (_isAmex && len(_cvv) != 4) || (!_isAmex && len(_cvv) != 3) {
+		res.Message = "PAYMENTS_CREDIT_CARD_VERIFICATION_VALUE_INVALID_FOR_CARD_TYPE"
+		res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
+		return res
+	}
 	defer func() {
 		atomic.AddInt64(&metrics.ActiveChecks, -1)
 		if res.Time == "" {
@@ -2193,6 +2215,71 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 		}
 		_prevPrevSig, _prevSig = _prevSig, _sig
+		// Refresh strategy handles from the latest seller block (proposal
+		// may have had PendingTerms; submit responses carry the filled list).
+		if ab := fastExtract(sellerBlock(body), "availableDeliveryStrategies"); ab != nil && len(ab) > 2 {
+			inner := ab[1 : len(ab)-1]
+			depth, start, inStr := 0, 0, false
+			for i := 0; i < len(inner); i++ {
+				c := inner[i]
+				if inStr {
+					if c == '\\' {
+						i++
+					} else if c == '"' {
+						inStr = false
+					}
+					continue
+				}
+				switch c {
+				case '"':
+					inStr = true
+				case '{', '[':
+					if depth == 0 {
+						start = i
+					}
+					depth++
+				case '}', ']':
+					depth--
+					if depth == 0 {
+						item := inner[start : i+1]
+						if hi := bytes.Index(item, []byte(`"handle"`)); hi != -1 {
+							rest := item[hi+len(`"handle"`):]
+							rest = bytes.TrimLeft(rest, " \t\n\r:")
+							rest = bytes.TrimLeft(rest, " \t\n\r:")
+							if len(rest) > 0 && rest[0] == '"' {
+								end := 1
+								for end < len(rest) && rest[end] != '"' {
+									if rest[end] == '\\' {
+										end++
+									}
+									end++
+								}
+								if h := string(rest[1:end]); h != "" {
+									_dup := false
+									for _, _e := range _stratHandles {
+										if _e == h {
+											_dup = true
+											break
+										}
+									}
+									if !_dup {
+										_stratHandles = append(_stratHandles, h)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		// Null-tax fast break: lone TAX_NEW_TAX with totalTaxAmount null
+		// means no figure exists to ACK with — terminal now, not after 8
+		// futile rounds (~60s burned per card otherwise).
+		if len(errCodes) == 1 && errCodes[0] == "TAX_NEW_TAX_MUST_BE_ACCEPTED" {
+			if tb := fastExtract(sellerBlock(body), "tax"); tb != nil && bytes.Contains(tb, []byte(`"totalTaxAmount":null`)) {
+				break
+			}
+		}
 		// Delivery-strategy rejected: cycle the seller's remaining handles.
 		// (Deleting the selection is schema-invalid — non-nullable field.)
 		// Handles exhausted → resubmits repeat → stuck-break terminates.
