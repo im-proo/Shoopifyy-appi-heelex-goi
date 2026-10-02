@@ -14,11 +14,14 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -64,7 +67,71 @@ var dialCodes = map[string]string{
 	"US": "1", "CA": "1", "GB": "44", "IN": "91", "AE": "971", "HK": "852",
 	"CN": "86", "CH": "41", "AU": "61", "DE": "49", "NZ": "64", "JP": "81",
 	"SG": "65", "SE": "46", "NO": "47", "DK": "45", "FR": "33", "MX": "52",
-	"BR": "55",
+	"BR": "55", "IE": "353", "IT": "39", "ES": "34", "NL": "31", "BE": "32",
+	"AT": "43", "PL": "48", "CZ": "420", "PT": "351", "GR": "30", "KR": "82",
+	"TW": "886", "TH": "66", "MY": "60", "PH": "63", "ID": "62", "ZA": "27",
+	"IL": "972", "TR": "90", "SA": "966", "AR": "54", "CL": "56", "CO": "57",
+	"PE": "51", "RU": "7", "UA": "380",
+}
+
+// mobilePrefixes: valid FIRST national digit band per country (strict
+// libphonenumber-validity stores refuse wrong leading digits, e.g. HK
+// mobiles must start 5-9, GB mobiles 7, AU mobiles 4).
+var mobilePrefixes = map[string][2]int{
+	"US": {2, 9}, "CA": {2, 9}, "GB": {7, 7}, "IN": {6, 9}, "HK": {5, 9},
+	"SG": {8, 9}, "AU": {4, 4}, "DE": {1, 5}, "FR": {6, 7}, "JP": {7, 9},
+	"MX": {5, 5}, "NZ": {2, 2}, "IT": {3, 3}, "ES": {6, 7}, "NL": {6, 6},
+	"BE": {4, 4}, "AT": {6, 6}, "PL": {5, 5}, "CZ": {6, 7}, "PT": {9, 9},
+	"GR": {6, 6}, "KR": {1, 1}, "TW": {9, 9}, "TH": {6, 8}, "MY": {1, 1},
+	"PH": {9, 9}, "ID": {8, 8}, "ZA": {6, 8}, "IL": {5, 5}, "TR": {5, 5},
+	"SA": {5, 5}, "AR": {9, 9}, "CL": {9, 9}, "CO": {3, 3}, "PE": {9, 9},
+	"RU": {9, 9}, "UA": {6, 9}, "CN": {1, 1}, "CH": {7, 7}, "AE": {5, 5},
+	"SE": {7, 7}, "NO": {4, 9}, "DK": {2, 9}, "IE": {8, 8},
+}
+
+// nationalLengths: national significant digits per country. Preferred over
+// Book-derived length when present.
+var nationalLengths = map[string]int{
+	"US": 10, "CA": 10, "GB": 10, "IN": 10, "HK": 8, "SG": 8, "AU": 9,
+	"DE": 10, "FR": 9, "JP": 10, "MX": 10, "NZ": 9, "IT": 10, "ES": 9,
+	"NL": 9, "BE": 9, "AT": 10, "PL": 9, "CZ": 9, "PT": 9, "GR": 10,
+	"KR": 10, "TW": 9, "TH": 9, "MY": 9, "PH": 10, "ID": 10, "ZA": 9,
+	"IL": 9, "TR": 10, "SA": 9, "AR": 10, "CL": 9, "CO": 10, "PE": 9,
+	"RU": 10, "UA": 9, "CN": 11, "CH": 9, "AE": 9, "SE": 9, "NO": 8,
+	"DK": 8, "IE": 9, "BR": 11,
+}
+
+// randNationalDigits returns n random digits honoring the country's mobile
+// first-digit band (falls back to 2-9) plus the plausibility filter.
+func randNationalDigits(n int, country string) string {
+	lo, hi := 2, 9
+	if band, ok := mobilePrefixes[country]; ok {
+		lo, hi = band[0], band[1]
+	}
+	gen := ""
+	for t := 0; t < 25; t++ {
+		gen = ""
+		for i := 0; i < n; i++ {
+			var d int
+			if i == 0 {
+				// First digit: country mobile band (GB 7, AU 4, HK 5-9…).
+				d = lo
+				if hi > lo {
+					d += rand.Intn(hi - lo + 1)
+				}
+				if d < 2 || d > 9 {
+					d = 2 + rand.Intn(8)
+				}
+			} else {
+				d = rand.Intn(10)
+			}
+			gen += string(rune('0' + d))
+		}
+		if plausibleNationalNumber(gen, country) {
+			break
+		}
+	}
+	return gen
 }
 
 // randomizedPhones builds per-check phone renderings from the Book entry:
@@ -91,20 +158,10 @@ func randomizedPhones(addr Address) (string, string, string) {
 	if n <= 0 {
 		return "", "", ""
 	}
-	gen := ""
-	for _t := 0; _t < 25; _t++ {
-		gen = ""
-		for i := 0; i < n; i++ {
-			d := rand.Intn(10)
-			if i == 0 && d < 2 {
-				d = 2 + rand.Intn(8)
-			}
-			gen += string(rune('0' + d))
-		}
-		if plausibleNationalNumber(gen, addr.CountryCode) {
-			break
-		}
+	if nl, ok := nationalLengths[addr.CountryCode]; ok && nl > 0 {
+		n = nl
 	}
+	gen := randNationalDigits(n, addr.CountryCode)
 	return "+" + dial + gen, gen, "+" + dial + " " + gen
 }
 
@@ -194,6 +251,32 @@ var Book = map[string]Address{
 	"FR":      {"1 Rue de Rivoli", "Paris", "75001", "", "FR", "142345678"},
 	"MX":      {"Reforma 222", "Mexico City", "06600", "CDMX", "MX", "5512345678"},
 	"BR":      {"Av Paulista 1000", "Sao Paulo", "01310-100", "SP", "BR", "1112345678"},
+	"IE":      {"1 OConnell Street", "Dublin", "D01 F5P2", "L", "IE", "3531234567"},
+	"IT":      {"Via Roma 1", "Rome", "00187", "RM", "IT", "39061234567"},
+	"ES":      {"Calle Mayor 1", "Madrid", "28013", "MD", "ES", "34912345678"},
+	"NL":      {"Damrak 1", "Amsterdam", "1012 LG", "NH", "NL", "31201234567"},
+	"BE":      {"Rue Neuve 1", "Brussels", "1000", "BRU", "BE", "3221234567"},
+	"AT":      {"Karntner Strasse 1", "Vienna", "1010", "WI", "AT", "4311234567"},
+	"PL":      {"Nowy Swiat 1", "Warsaw", "00-001", "MZ", "PL", "48221234567"},
+	"CZ":      {"Wenceslas Square 1", "Prague", "110 00", "PR", "CZ", "42021234567"},
+	"PT":      {"Avenida da Liberdade 1", "Lisbon", "1250-096", "LI", "PT", "35121234567"},
+	"GR":      {"Ermou 1", "Athens", "105 63", "AT", "GR", "30211234567"},
+	"KR":      {"Gangnam-daero 1", "Seoul", "06000", "11", "KR", "82212345678"},
+	"TW":      {"Zhongxiao East Road 1", "Taipei", "100", "TPE", "TW", "88621234567"},
+	"TH":      {"Sukhumvit Road 1", "Bangkok", "10110", "10", "TH", "6621234567"},
+	"MY":      {"Jalan Bukit Bintang 1", "Kuala Lumpur", "55100", "14", "MY", "60312345678"},
+	"PH":      {"Ayala Avenue 1", "Manila", "1226", "NCR", "PH", "+6321234567"},
+	"ID":      {"Jalan Sudirman 1", "Jakarta", "10220", "JK", "ID", "6221234567"},
+	"ZA":      {"Long Street 1", "Cape Town", "8001", "WC", "ZA", "27212345678"},
+	"IL":      {"Rothschild Boulevard 1", "Tel Aviv", "6688101", "TA", "IL", "9721234567"},
+	"TR":      {"Istiklal Caddesi 1", "Istanbul", "34435", "34", "TR", "902121234567"},
+	"SA":      {"King Fahd Road 1", "Riyadh", "12211", "01", "SA", "966112345678"},
+	"AR":      {"Avenida Corrientes 1", "Buenos Aires", "C1043", "C", "AR", "541112345678"},
+	"CL":      {"Avenida Providencia 1", "Santiago", "7500000", "RM", "CL", "56221234567"},
+	"CO":      {"Carrera 7 1", "Bogota", "110111", "DC", "CO", "5711234567"},
+	"PE":      {"Avenida Arequipa 1", "Lima", "15046", "LIM", "PE", "5111234567"},
+	"RU":      {"Tverskaya Street 1", "Moscow", "125009", "MOW", "RU", "74951234567"},
+	"UA":      {"Khreshchatyk 1", "Kyiv", "01001", "30", "UA", "380441234567"},
 	"DEFAULT": {"123 Main", "New York", "10080", "NY", "US", "2194157586"},
 }
 
@@ -254,10 +337,35 @@ type Metrics struct {
 	CaptchaBlocked  int64
 	ThreeDSCount    int64
 	StillProcessing int64
+	CacheHits       int64
+	CacheMisses     int64
+	CartCreateFails int64
+	PCIFails        int64
+	SubmitFails     int64
 }
 
 var metrics Metrics
 var startTime = time.Now()
+
+// Per-code counters for the /metrics endpoint (error taxonomy observability).
+var errorCodeCounters sync.Map
+
+func incErrorCode(code string) {
+	if code == "" {
+		code = "UNKNOWN"
+	}
+	v, _ := errorCodeCounters.LoadOrStore(code, new(int64))
+	atomic.AddInt64(v.(*int64), 1)
+}
+
+func snapshotErrorCodes() map[string]int64 {
+	out := map[string]int64{}
+	errorCodeCounters.Range(func(k, v interface{}) bool {
+		out[k.(string)] = atomic.LoadInt64(v.(*int64))
+		return true
+	})
+	return out
+}
 
 // Gentle-traffic pacing (ported from the minimal Python engine that charges
 // with fewer defenses triggered): stagger checkout starts >=50ms apart and
@@ -1018,9 +1126,11 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 // This is the biggest performance win: 1000 cards on the same store = 1 fetch.
 func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
 	if id, price, cur, shipping, ok := cacheLookupVariant(baseURL); ok {
+		atomic.AddInt64(&metrics.CacheHits, 1)
 		log.Printf("[CACHE HIT] variant for %s", baseURL)
 		return id, price, cur, shipping, nil
 	}
+	atomic.AddInt64(&metrics.CacheMisses, 1)
 	if v, ok := variantMiss.Load(baseURL); ok {
 		if ts, ok := v.(time.Time); ok && time.Now().Before(ts) {
 			return "", 0, "", false, fmt.Errorf("no valid paid variant found (cached)")
@@ -1132,6 +1242,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 		}
 		updateMetricsAndDead(res.Message, baseURL)
+		incErrorCode(res.Message)
 	}()
 
 	// Dead store fast-path
@@ -1204,20 +1315,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		if phoneDial == "" || phoneNatLen <= 0 {
 			return
 		}
-		_gen := ""
-		for _t := 0; _t < 25; _t++ {
-			_gen = ""
-			for _i := 0; _i < phoneNatLen; _i++ {
-				_dg := rand.Intn(10)
-				if _i == 0 && _dg < 2 {
-					_dg = 2 + rand.Intn(8)
-				}
-				_gen += string(rune('0' + _dg))
-			}
-			if plausibleNationalNumber(_gen, addr.CountryCode) {
-				break
-			}
+		if nl, ok := nationalLengths[addr.CountryCode]; ok && nl > 0 {
+			phoneNatLen = nl
 		}
+		_gen := randNationalDigits(phoneNatLen, addr.CountryCode)
 		phoneE164 = "+" + phoneDial + _gen
 		phoneLocal = _gen
 		phoneRaw = "+" + phoneDial + " " + _gen
@@ -1298,6 +1399,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			return res
 		}
 		res.Message = "Cart permalink failed"
+		atomic.AddInt64(&metrics.CartCreateFails, 1)
 		if proxyStr != "" {
 			res.Proxy = "Dead"
 		}
@@ -1884,6 +1986,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	// wasted cycle. Fail fast so the bot rotates site/proxy instead.
 	if pciToken == "" {
 		res.Message = "PCI_TOKEN_FAILED"
+		atomic.AddInt64(&metrics.PCIFails, 1)
 		return res
 	}
 
@@ -1994,6 +2097,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	body, _, err = doReq(ctx, client, "POST", graphqlURL+"?operationName=SubmitForCompletion", headers, bytes.NewReader(submitPayload))
 	if err != nil {
 		res.Message = "Submit failed"
+		atomic.AddInt64(&metrics.SubmitFails, 1)
 		return res
 	}
 	if isCaptchaRequired(body) {
@@ -2744,6 +2848,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	if total > 0 {
 		hitRate = float64(hits) / float64(total) * 100.0
 	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":                "online",
@@ -2753,15 +2859,32 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		"total_checks":          total,
 		"total_hits":            hits,
 		"hit_rate":              fmt.Sprintf("%.2f%%", hitRate),
+		"total_failed":          atomic.LoadInt64(&metrics.TotalFailed),
 		"rate_limited":          atomic.LoadInt64(&metrics.RateLimited),
 		"captcha_blocked":       atomic.LoadInt64(&metrics.CaptchaBlocked),
 		"3ds_count":             atomic.LoadInt64(&metrics.ThreeDSCount),
 		"still_processing":      atomic.LoadInt64(&metrics.StillProcessing),
+		"cart_create_fails":     atomic.LoadInt64(&metrics.CartCreateFails),
+		"pci_fails":             atomic.LoadInt64(&metrics.PCIFails),
+		"submit_fails":          atomic.LoadInt64(&metrics.SubmitFails),
+		"cache_hits":            atomic.LoadInt64(&metrics.CacheHits),
+		"cache_misses":          atomic.LoadInt64(&metrics.CacheMisses),
 		"variant_cache_size":    mapSize(&variantCache),
 		"dead_stores":           mapSize(&deadStores),
 		"active_users":          len(userSems),
+		"goroutines":            runtime.NumGoroutine(),
+		"memory_alloc_mb":       float64(m.Alloc) / 1024 / 1024,
+		"memory_sys_mb":         float64(m.Sys) / 1024 / 1024,
+		"num_gc":                m.NumGC,
 		"per_user_concurrent":   PER_USER_CONCURRENT,
 		"global_max_concurrent": GLOBAL_MAX_CONCURRENT,
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error_codes": snapshotErrorCodes(),
 	})
 }
 
@@ -2782,6 +2905,7 @@ func main() {
 	mux.HandleFunc("/validate", validateHandler)
 	mux.HandleFunc("/cache", cacheHandler)
 	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
@@ -2802,7 +2926,21 @@ func main() {
 	log.Printf("🚀 Shopify Checkout Engine starting on port %s\n", port)
 	log.Printf("⚡ Auto-Variant | SOCKS + HTTP Proxies | %d Concurrent | 1GB RAM Optimized\n", GLOBAL_MAX_CONCURRENT)
 	log.Printf("[BUILD dbg-fallback-v1 fetch15s pace poll8 nocaptcha-dead]")
-	if err := server.ListenAndServe(); err != nil {
+	log.Printf("Go runtime: %s, GOMAXPROCS=%d", runtime.Version(), runtime.GOMAXPROCS(0))
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Printf("Shutdown signal received — draining in-flight checks")
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server crashed: %v", err)
 	}
 }
