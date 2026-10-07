@@ -34,8 +34,6 @@ import (
 const (
 	// Capped for a 2GB box: 1500/500 in-flight GraphQL checks ballooned to
 	// 471MB RSS and got OOM-killed mid-mass-check. 120/60 keeps RSS <150MB.
-	PER_USER_CONCURRENT   = 60
-	GLOBAL_MAX_CONCURRENT = 120
 	MAX_POLL_ATTEMPTS     = 8
 	POLL_INITIAL_DELAY    = 600 * time.Millisecond
 	POLL_MAX_DELAY        = 1200 * time.Millisecond
@@ -46,6 +44,22 @@ const (
 	CTX_TIMEOUT           = 90 * time.Second
 	HTTP_TIMEOUT          = 45 * time.Second
 )
+
+// Concurrency caps, tunable via env for small hosts.
+// (Render 512MB free tier: PER_USER_CONCURRENT=30.)
+var (
+	PER_USER_CONCURRENT   = envInt("PER_USER_CONCURRENT", 60)
+	GLOBAL_MAX_CONCURRENT = envInt("GLOBAL_MAX_CONCURRENT", 120)
+)
+
+func envInt(key string, def int) int {
+	if s := strings.TrimSpace(os.Getenv(key)); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 var C2C = map[string]string{
 	"USD": "US", "CAD": "CA", "INR": "IN", "AED": "AE", "HKD": "HK", "GBP": "GB",
