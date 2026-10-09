@@ -92,7 +92,7 @@ var dialCodes = map[string]string{
 // libphonenumber-validity stores refuse wrong leading digits, e.g. HK
 // mobiles must start 5-9, GB mobiles 7, AU mobiles 4).
 var mobilePrefixes = map[string][2]int{
-	"US": {2, 9}, "CA": {2, 9}, "GB": {7, 7}, "IN": {6, 9}, "HK": {5, 9},
+	"US": {2, 9}, "CA": {2, 9}, "GB": {7, 7}, "IN": {6, 9}, "HK": {4, 9},
 	"SG": {8, 9}, "AU": {4, 4}, "DE": {1, 5}, "FR": {6, 7}, "JP": {7, 9},
 	"MX": {5, 5}, "NZ": {2, 2}, "IT": {3, 3}, "ES": {6, 7}, "NL": {6, 6},
 	"BE": {4, 4}, "AT": {6, 6}, "PL": {5, 5}, "CZ": {6, 7}, "PT": {9, 9},
@@ -221,6 +221,11 @@ func plausibleNationalNumber(digits, country string) bool {
 	if (country == "US" || country == "CA") && len(digits) == 10 {
 		area, exch := digits[0:3], digits[3:6]
 		if area[0] < '2' || area[1:3] == "11" || exch[0] < '2' || exch[1:3] == "11" {
+			return false
+		}
+		// 555-01XX is the reserved fictional range (libphonenumber docs);
+		// validators flag it. Any 555 exchange is suspicious — reject.
+		if exch == "555" {
 			return false
 		}
 	}
@@ -982,6 +987,94 @@ func rejectNeedsTermAccept(codes []string) bool {
 
 const VARIANT_FETCH_QUERY = `query{products(first:50){edges{node{variants(first:50){edges{node{id availableForSale requiresShipping price{amount currencyCode}}}}}}}}`
 
+// fetchREST pulls variants from /products.json (no token needed). Runs
+// BEFORE the GraphQL path: token scraping fails on JS-heavy catalogs while
+// products.json usually answers.
+func fetchREST(ctx context.Context, client *http.Client, baseURL string) []byte {
+	rctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	for _, p := range []string{"/products.json?limit=250", "/products.json?limit=100"} {
+		req, err := http.NewRequestWithContext(rctx, "GET", baseURL+p, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 && len(body) > 100 && bytes.Contains(body, []byte(`"variants"`)) {
+			return body
+		}
+	}
+	return nil
+}
+
+func pickREST(data []byte) (string, float64, bool, bool) {
+	var r struct {
+		Products []struct {
+			Variants []struct {
+				ID              int64  `json:"id"`
+				Available       *bool  `json:"available"`
+				RequiresShipping *bool `json:"requires_shipping"`
+				Price           string `json:"price"`
+			} `json:"variants"`
+		} `json:"products"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil || len(r.Products) == 0 {
+		return "", 0, false, false
+	}
+	type candidate struct {
+		id       string
+		price    float64
+		band     int
+		shipping bool
+	}
+	var pool []candidate
+	for _, p := range r.Products {
+		for _, v := range p.Variants {
+			if v.Available != nil && !*v.Available {
+				continue
+			}
+			if v.ID == 0 {
+				continue
+			}
+			price, err := strconv.ParseFloat(strings.ReplaceAll(v.Price, ",", ""), 64)
+			if err != nil || price <= 0 {
+				continue
+			}
+			ship := true
+			if v.RequiresShipping != nil {
+				ship = *v.RequiresShipping
+			}
+			band := 4
+			if price <= 1.0 {
+				band = 1
+			} else if price <= 5.0 {
+				band = 2
+			} else if price <= 10.0 {
+				band = 3
+			}
+			pool = append(pool, candidate{id: strconv.FormatInt(v.ID, 10), price: price, band: band, shipping: ship})
+		}
+	}
+	if len(pool) == 0 {
+		return "", 0, false, false
+	}
+	best := pool[0]
+	for _, c := range pool[1:] {
+		if c.band < best.band ||
+			(c.band == best.band && c.shipping && !best.shipping) ||
+			(c.band == best.band && c.shipping == best.shipping && c.price < best.price) {
+			best = c
+		}
+	}
+	return best.id, best.price, best.shipping, true
+}
+
 func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
 	// Bound the whole variant hunt: sequential version attempts + homepage scrape
 	// must never burn the 90s request budget (was hitting 90.00s wall).
@@ -1104,6 +1197,15 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 		return best.id, best.price, best.currency, best.shipping, true
 	}
 
+	// REST-first: /products.json needs no storefront token and works on
+	// stores where token scraping fails (JS catalogs, odd themes). Currency
+	// is absent from this endpoint — caller keeps its default.
+	if body := fetchREST(ctx, client, baseURL); body != nil {
+		if id, price, shipping, ok := pickREST(body); ok {
+			return id, price, "", shipping, nil
+		}
+	}
+
 	if body := fetch(""); body != nil {
 		if id, price, cur, shipping, ok := pick(body); ok {
 			return id, price, cur, shipping, nil
@@ -1139,8 +1241,7 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 
 // fetchVariantCached wraps fetchVariant with a 10-minute per-store cache.
 // This is the biggest performance win: 1000 cards on the same store = 1 fetch.
-func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
-	if id, price, cur, shipping, ok := cacheLookupVariant(baseURL); ok {
+func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {	if id, price, cur, shipping, ok := cacheLookupVariant(baseURL); ok {
 		atomic.AddInt64(&metrics.CacheHits, 1)
 		log.Printf("[CACHE HIT] variant for %s", baseURL)
 		return id, price, cur, shipping, nil
@@ -1315,7 +1416,9 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		}
 		variantID = vid
 		res.Price = price
-		res.Currency = cur
+		if cur != "" {
+			res.Currency = cur
+		}
 		requiresShipping = shipping
 		log.Printf("[AUTO] Found variant %s ($%.2f %s, shipping=%v) for %s", vid, price, cur, shipping, baseURL)
 	}
