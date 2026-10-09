@@ -2972,6 +2972,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":                "online",
 		"engine":                "Go Checkout Engine - Benchmark Edition",
+		"build":                 BUILD_VERSION,
+		"receipt_support":       RECEIPT_SUPPORT,
 		"uptime":                formatUptime(time.Since(startTime)),
 		"active_checks":         atomic.LoadInt64(&metrics.ActiveChecks),
 		"total_checks":          total,
@@ -3010,6 +3012,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // MAIN
 // ==========================================
 
+// BUILD_VERSION bumps on every shipped change. Surfaced on / and
+// /status so operators verify a deploy took (receipt support etc).
+const BUILD_VERSION = "v12-receipt"
+const RECEIPT_SUPPORT = true
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
@@ -3026,7 +3033,11 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":          "ok",
+			"build":           BUILD_VERSION,
+			"receipt_support": RECEIPT_SUPPORT,
+		})
 	})
 
 	port := os.Getenv("PORT")
