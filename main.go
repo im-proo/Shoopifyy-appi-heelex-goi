@@ -1184,6 +1184,8 @@ type CheckoutResult struct {
 	Proxy    string  `json:"Proxy"`
 	Time     string  `json:"Time"`
 	CC       string  `json:"cc"`
+	// Order receipt URL (ProcessedReceipt redirectUrl). Empty unless ORDER_PAID.
+	Redirect string `json:"Redirect"`
 }
 
 // sellerBlock returns sellerProposal subtree (avoids buyerProposal echo values).
@@ -2509,6 +2511,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		if receiptType == "ProcessedReceipt" {
 			res.Success = true
 			res.Message = "ORDER_PAID"
+			res.Redirect = fstr(fastExtract(body, "receipt"), "redirectUrl")
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
 		} else if receiptType == "ActionRequiredReceipt" {
@@ -2584,6 +2587,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		if pollType == "ProcessedReceipt" {
 			res.Success = true
 			res.Message = "ORDER_PAID"
+			res.Redirect = fstr(fastExtract(body, "receipt"), "redirectUrl")
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
 		} else if pollType == "FailedReceipt" {
