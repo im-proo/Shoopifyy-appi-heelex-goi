@@ -1822,6 +1822,17 @@ func setSubmitPaymentID(submitVars map[string]interface{}, pid string) {
 	_dpm["paymentMethodIdentifier"] = pid
 }
 
+// setSubmitSessionTokens writes refreshed queueToken/checkpointData through
+// to an already-built submitVars. No-op on unexpected shapes.
+func setSubmitSessionTokens(submitVars map[string]interface{}, queueToken, checkpointData string) {
+	_in, ok := submitVars["input"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_in["queueToken"] = queueToken
+	_in["checkpointData"] = checkpointData
+}
+
 // syncProposalCurrency aligns a proposal variables map to cur: buyerIdentity
 // customer presentmentCurrency plus the concrete taxes value currencyCode
 // when that shape is present (any:true proposal taxes are skipped).
@@ -3005,11 +3016,16 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				break
 			}
 		}
-		// Rotated payment identifier: the seller's latest sellerProposal is
-		// authoritative. Handled standalone (not inside rejectNeedsTermAccept,
-		// whose matcher does not fire for this code alone).
+		// Flexibility terms are bound to the negotiation session: a rotated
+		// payment ID alone is not enough — re-negotiate for a current
+		// checkpoint/queueToken, then resubmit against the fresh session.
+		// Handled standalone (rejectNeedsTermAccept does not fire for this
+		// code alone). Reactive only: cards already terminal with this code.
 		for _, _c := range errCodes {
 			if strings.Contains(_c, "FLEXIBILITY") {
+				_oldPid := paymentIdentifier
+				refreshProposal()
+				setSubmitSessionTokens(submitVars, queueToken, checkpointData)
 				if pid, gw := extractPaymentID(body); pid != "" && pid != paymentIdentifier {
 					paymentIdentifier = pid
 					if gw != "" {
@@ -3018,6 +3034,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 					}
 					setSubmitPaymentID(submitVars, pid)
 				}
+				log.Printf("[DBG flex] cc=%s base=%s pidChanged=%v queueTokenLen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, paymentIdentifier != _oldPid, len(queueToken))
 				break
 			}
 		}
@@ -3164,8 +3181,8 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				_topErr = _topErr + "::" + _topMsg
 			}
 			_tb := fastExtract(sellerRej, "tax")
-			log.Printf("[DBG tax] cc=%s try=%d taxblk=%.300s", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), _rejTry, _tb)
-			log.Printf("[DBG retry] cc=%s try=%d codes=%q taxAmt=%q shape=%s newType=%q topErr=%q rblen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), _rejTry, errCodes, taxAmount, _taxShape, submitType, _topErr, len(body))
+			log.Printf("[DBG tax] cc=%s base=%s try=%d taxblk=%.300s", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, _rejTry, _tb)
+			log.Printf("[DBG retry] cc=%s base=%s try=%d codes=%q taxAmt=%q shape=%s newType=%q topErr=%q rblen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, _rejTry, errCodes, taxAmount, _taxShape, submitType, _topErr, len(body))
 		}
 	}
 
@@ -3698,7 +3715,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v16-flex-currency"
+const BUILD_VERSION = "v17-flex-repropose"
 const RECEIPT_SUPPORT = true
 
 func main() {

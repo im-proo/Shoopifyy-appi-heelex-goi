@@ -82,3 +82,20 @@ func TestSyncProposalCurrency(t *testing.T) {
 		t.Errorf("buyerIdentity = %q, want GBP", c)
 	}
 }
+
+// Session-token write-through must land on input.queueToken/checkpointData
+// and never panic on bad shapes.
+func TestSetSubmitSessionTokens(t *testing.T) {
+	sv := map[string]interface{}{
+		"input": map[string]interface{}{
+			"queueToken": "old-q", "checkpointData": "old-c",
+		},
+	}
+	setSubmitSessionTokens(sv, "new-q", "new-c")
+	_in := sv["input"].(map[string]interface{})
+	if _in["queueToken"] != "new-q" || _in["checkpointData"] != "new-c" {
+		t.Errorf("got %q/%q, want new-q/new-c", _in["queueToken"], _in["checkpointData"])
+	}
+	setSubmitSessionTokens(map[string]interface{}{}, "q", "c")
+	setSubmitSessionTokens(map[string]interface{}{"input": 1}, "q", "c")
+}
