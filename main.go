@@ -36,7 +36,11 @@ import (
 const (
 	// Capped for a 2GB box: 1500/500 in-flight GraphQL checks ballooned to
 	// 471MB RSS and got OOM-killed mid-mass-check. 120/60 keeps RSS <150MB.
-	MAX_POLL_ATTEMPTS     = 8
+	// Poll budget covers slow-settling receipts: a receipt still processing
+	// at attempt 8 may still become a charge, and abandoning it then logs a
+	// real order as STILL_PROCESSING with no receipt URL. 12 attempts adds
+	// ~5s worst case, only while the receipt is alive.
+	MAX_POLL_ATTEMPTS     = 12
 	POLL_INITIAL_DELAY    = 600 * time.Millisecond
 	POLL_MAX_DELAY        = 1200 * time.Millisecond
 	POLL_STEP             = 200 * time.Millisecond
@@ -3950,7 +3954,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v20-address2"
+const BUILD_VERSION = "v21-poll-receipt"
 const RECEIPT_SUPPORT = true
 
 func main() {
