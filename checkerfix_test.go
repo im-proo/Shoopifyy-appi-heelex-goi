@@ -259,3 +259,28 @@ func TestImpersonatedClientBuilds(t *testing.T) {
 		}
 	}
 }
+
+// ADDRESS2 remedy echoes address1 into the empty second line, both maps.
+func TestEnsureAddress2(t *testing.T) {
+	ba := map[string]interface{}{
+		"streetAddress": map[string]string{"address1": "Main 1", "city": "X"},
+	}
+	ss := map[string]string{"address1": "Main 1", "city": "X"}
+	ensureAddress2(ba, ss)
+	if got := ba["streetAddress"].(map[string]string)["address2"]; got != "Main 1" {
+		t.Errorf("billing address2 = %q", got)
+	}
+	if got := ss["address2"]; got != "Main 1" {
+		t.Errorf("ship address2 = %q", got)
+	}
+	// Present values are never clobbered.
+	ba["streetAddress"].(map[string]string)["address2"] = "Apt 5"
+	ss["address2"] = "Apt 5"
+	ensureAddress2(ba, ss)
+	if got := ba["streetAddress"].(map[string]string)["address2"]; got != "Apt 5" {
+		t.Errorf("billing clobbered: %q", got)
+	}
+	// Bad shapes: no-op, no panic.
+	ensureAddress2(map[string]interface{}{}, ss)
+	ensureAddress2(map[string]interface{}{"streetAddress": 1}, ss)
+}

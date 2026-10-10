@@ -1999,6 +1999,20 @@ func setSubmitSessionTokens(submitVars map[string]interface{}, queueToken, check
 	_in["checkpointData"] = checkpointData
 }
 
+// ensureAddress2 fills a missing address2 line by echoing address1.
+// Reactive-only remedy for DELIVERY_ADDRESS2_REQUIRED: stores that demand a
+// second line fail the card otherwise, so echoing is pure upside.
+func ensureAddress2(billingAddr map[string]interface{}, shipStreet map[string]string) {
+	if _sa, ok := billingAddr["streetAddress"].(map[string]string); ok {
+		if _sa["address2"] == "" {
+			_sa["address2"] = _sa["address1"]
+		}
+	}
+	if shipStreet["address2"] == "" {
+		shipStreet["address2"] = shipStreet["address1"]
+	}
+}
+
 // syncProposalCurrency aligns a proposal variables map to cur: buyerIdentity
 // customer presentmentCurrency plus the concrete taxes value currencyCode
 // when that shape is present (any:true proposal taxes are skipped).
@@ -3195,6 +3209,15 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				break
 			}
 		}
+		// Second address line demanded: echo address1 into address2 on
+		// billing + delivery (reactive only; stores that don't demand it
+		// never see the field).
+		for _, _c := range errCodes {
+			if strings.Contains(_c, "ADDRESS2") {
+				ensureAddress2(billingAddr, shipStreet)
+				break
+			}
+		}
 		// Phone rejected: REQUIRED restores a present shape; any other
 		// PHONE pattern advances the rendering cycle (omit → local →
 		// raw → e164). Stuck-break bounds stores that reject everything.
@@ -3927,7 +3950,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v19-flex-shape"
+const BUILD_VERSION = "v20-address2"
 const RECEIPT_SUPPORT = true
 
 func main() {
