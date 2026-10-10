@@ -284,3 +284,19 @@ func TestEnsureAddress2(t *testing.T) {
 	ensureAddress2(map[string]interface{}{}, ss)
 	ensureAddress2(map[string]interface{}{"streetAddress": 1}, ss)
 }
+
+// Pinned-variant lookup: exact hit, case-insensitive fallback, miss.
+func TestPinnedVariant(t *testing.T) {
+	if n := len(pinnedVariants); n != 315 {
+		t.Fatalf("pinnedVariants = %d, want 315", n)
+	}
+	if got := pinnedVariant("https://arizonasun.myshopify.com"); got != "44042332176564" {
+		t.Errorf("arizonasun pin = %q", got)
+	}
+	if got := pinnedVariant("https://ARIZONASUN.myshopify.com"); got != "44042332176564" {
+		t.Errorf("case-insensitive pin = %q", got)
+	}
+	if got := pinnedVariant("https://no-such-store.example.com"); got != "" {
+		t.Errorf("unknown store pin = %q, want empty", got)
+	}
+}

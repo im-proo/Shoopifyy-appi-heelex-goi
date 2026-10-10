@@ -1837,6 +1837,18 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 	return "", 0, "", false, fmt.Errorf("no valid paid variant found")
 }
 
+// pinnedVariant returns the audited cheapest variant for a pool store,
+// or "" when unmapped (auto-fetch path, unchanged).
+func pinnedVariant(baseURL string) string {
+	if pid, ok := pinnedVariants[baseURL]; ok {
+		return pid
+	}
+	if pid, ok := pinnedVariants[strings.ToLower(baseURL)]; ok {
+		return pid
+	}
+	return ""
+}
+
 // fetchVariantCached wraps fetchVariant with a 10-minute per-store cache.
 // This is the biggest performance win: 1000 cards on the same store = 1 fetch.
 func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {	if id, price, cur, shipping, ok := cacheLookupVariant(baseURL); ok {
@@ -2132,6 +2144,20 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	// Default to true so externally supplied variant IDs assume physical goods
 	// (preserves legacy behavior when requiresShipping is unknown).
 	requiresShipping := true
+	pinTried := false
+	fromPin := false
+acquireVariant:
+	if variantID == "" && !pinTried {
+		// Hardcoded audit pins first: reproduce the mapped cheapest variant
+		// with no fetch round-trip. A stale pin (sold out / unpublished)
+		// falls back to auto-fetch at the cart-failure exits below.
+		pinTried = true
+		if pid := pinnedVariant(baseURL); pid != "" {
+			variantID = pid
+			fromPin = true
+			log.Printf("[PIN] using pinned variant %s for %s", pid, baseURL)
+		}
+	}
 	if variantID == "" {
 		vid, price, cur, shipping, err := fetchVariantCached(ctx, client, baseURL)
 		if err != nil {
@@ -2289,6 +2315,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		}
 		log.Printf("[DBG cart] base=%s status=%d err=%q hasProxy=%v", baseURL, status, _cartErr, proxyStr != "")
 		atomic.AddInt64(&metrics.CartCreateFails, 1)
+		if fromPin {
+			// Pinned variant went stale: drop it for this check and
+			// fall back to auto-fetch (second pass skips the pin).
+			log.Printf("[PIN] stale pin %s for %s, falling back to auto-fetch", variantID, baseURL)
+			fromPin = false
+			variantID = ""
+			goto acquireVariant
+		}
 		if proxyStr != "" {
 			res.Proxy = "Dead"
 		}
@@ -2377,6 +2411,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			return res
 		}
 		res.Message = "CHECKOUT_SESSION_FAILED"
+		if fromPin {
+			// Same stale-pin fallback as the cart-permalink exit: the pin
+			// yielded no session, retry once via auto-fetch.
+			log.Printf("[PIN] stale pin %s for %s, falling back to auto-fetch", variantID, baseURL)
+			fromPin = false
+			variantID = ""
+			goto acquireVariant
+		}
 		return res
 	}
 
@@ -3954,7 +3996,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v21-poll-receipt"
+const BUILD_VERSION = "v22-pinned-variants"
 const RECEIPT_SUPPORT = true
 
 func main() {
