@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	utls "github.com/bogdanfinn/utls"
 	"golang.org/x/net/proxy"
 )
 
@@ -949,6 +951,133 @@ func mapSize(m *sync.Map) int {
 // HIGH-PERFORMANCE HTTP ENGINE
 // ==========================================
 
+// ==========================================
+// CLIENT-PROFILE CANARIES (env-gated, default off)
+// ==========================================
+//
+// Stock Go emits a distinctive TLS JA3 + forced HTTP/2; browser headers
+// over that handshake trip bot walls that a Chrome-shaped profile passes
+// on the SAME proxy (the usual reason "their Python API works, ours
+// doesn't": those stacks impersonate Chrome via curl-impersonate).
+// Go's Transport offers no TLS hook on the HTTP-proxy CONNECT path
+// (it handshakes stock itself), so impersonation tunnels manually.
+//
+// SHOPAPI_H1_ONLY=1 .... HTTP/1.1 only (drop forced H2; H2 framing is
+// ........................ also fingerprinted, Python stacks run H1).
+// TLS_IMPERSONATE=chrome  full Chrome profile: manual CONNECT/SOCKS/
+// ......................... direct dial + uTLS Chrome ClientHello.
+// ......................... Conns run H1 (Transport only speaks H2
+// ......................... over *tls.Conn); JA3 is what the wall keys on.
+//
+// Both default OFF: behavior is byte-identical to stock. Canary on ONE
+// service and compare CAPTCHA/cart/PCI buckets; unset to revert instantly.
+func h1Only() bool { return os.Getenv("SHOPAPI_H1_ONLY") == "1" }
+
+func tlsImpersonateChrome() bool { return os.Getenv("TLS_IMPERSONATE") == "chrome" }
+
+// chromeHandshake runs a Chrome-fingerprint TLS handshake over an
+// already-connected raw conn.
+func chromeHandshake(ctx context.Context, raw net.Conn, host string) (net.Conn, error) {
+	cfg := &utls.Config{ServerName: host, InsecureSkipVerify: true}
+	uconn := utls.UClient(raw, cfg, utls.HelloChrome_Auto, false, false)
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	return uconn, nil
+}
+
+// proxyConnectAuth renders the Proxy-Authorization value for a proxy URL
+// (mirrors Transport's default CONNECT credentials).
+func proxyConnectAuth(proxyURL *url.URL) string {
+	if proxyURL == nil || proxyURL.User == nil {
+		return ""
+	}
+	pass, _ := proxyURL.User.Password()
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username()+":"+pass))
+}
+
+// readConnectResponse reads a CONNECT reply byte-at-a-time up to the header
+// terminator (never over-reads into tunnel bytes) and requires status 200.
+func readConnectResponse(conn net.Conn, capBytes int) error {
+	var hdr []byte
+	one := make([]byte, 1)
+	for len(hdr) < capBytes {
+		n, err := conn.Read(one)
+		if err != nil || n == 0 {
+			return fmt.Errorf("proxy CONNECT read failed: %v", err)
+		}
+		hdr = append(hdr, one[0])
+		if len(hdr) >= 4 && string(hdr[len(hdr)-4:]) == "\r\n\r\n" {
+			break
+		}
+	}
+	if len(hdr) >= capBytes {
+		return fmt.Errorf("proxy CONNECT headers too large")
+	}
+	first := strings.SplitN(string(hdr), "\r\n", 2)[0]
+	parts := strings.Split(first, " ")
+	if len(parts) < 3 || !strings.HasPrefix(parts[0], "HTTP/") || parts[1] != "200" {
+		if len(first) > 80 {
+			first = first[:80]
+		}
+		return fmt.Errorf("proxy CONNECT rejected: %q", first)
+	}
+	return nil
+}
+
+// connectTunnel dials proxyAddr, issues CONNECT for target, and returns the
+// established tunnel. Deadline-bounded; cleared on success.
+func connectTunnel(ctx context.Context, proxyAddr, target, auth string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	raw, err := d.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+	var sb strings.Builder
+	sb.WriteString("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n")
+	if auth != "" {
+		sb.WriteString("Proxy-Authorization: " + auth + "\r\n")
+	}
+	sb.WriteString("\r\n")
+	if _, err := io.WriteString(raw, sb.String()); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if err := readConnectResponse(raw, 16*1024); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	_ = raw.SetDeadline(time.Time{})
+	return raw, nil
+}
+
+// chromeDialTLS is a Transport.DialTLSContext that impersonates Chrome
+// end-to-end. viaProxy==nil means direct dial via baseDial; otherwise the
+// proxy is tunnelled manually (Transport.Proxy must NOT also be set, or
+// the target is dialled twice).
+func chromeDialTLS(viaProxy *url.URL, baseDial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		if viaProxy != nil {
+			tunnel, err := connectTunnel(ctx, viaProxy.Host, addr, proxyConnectAuth(viaProxy))
+			if err != nil {
+				return nil, err
+			}
+			return chromeHandshake(ctx, tunnel, host)
+		}
+		raw, err := baseDial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return chromeHandshake(ctx, raw, host)
+	}
+}
+
 var GlobalClient *http.Client
 
 func init() {
@@ -973,6 +1102,26 @@ func getProxyClient(proxyStr string) (*http.Client, error) {
 	jar, _ := cookiejar.New(nil)
 
 	if proxyStr == "" {
+		if h1Only() || tlsImpersonateChrome() {
+			// Dedicated (non-shared) transport so canaries never mutate
+			// the shared GlobalClient profile.
+			t := &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     30 * time.Second,
+				TLSHandshakeTimeout: 5 * time.Second,
+				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+				DisableCompression:  true,
+			}
+			if !h1Only() {
+				t.ForceAttemptHTTP2 = true
+			}
+			if tlsImpersonateChrome() {
+				d := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+				t.DialTLSContext = chromeDialTLS(nil, d.DialContext)
+			}
+			return &http.Client{Jar: jar, Transport: t, Timeout: HTTP_TIMEOUT}, nil
+		}
 		return &http.Client{
 			Jar:       jar,
 			Transport: GlobalClient.Transport,
@@ -1008,6 +1157,11 @@ func getProxyClient(proxyStr string) (*http.Client, error) {
 			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
 			DisableCompression: true,
 		}
+		if tlsImpersonateChrome() {
+			transport.DialTLSContext = chromeDialTLS(nil, func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			})
+		}
 		return &http.Client{
 			Jar:       jar,
 			Transport: transport,
@@ -1015,6 +1169,18 @@ func getProxyClient(proxyStr string) (*http.Client, error) {
 		}, nil
 	}
 
+	if tlsImpersonateChrome() {
+		// No Transport.Proxy here: chromeDialTLS tunnels CONNECT manually.
+		// Setting both would dial the target twice (proxy bypass + leak).
+		t := &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  true,
+		}
+		t.DialTLSContext = chromeDialTLS(proxyURL, nil)
+		return &http.Client{Jar: jar, Transport: t, Timeout: HTTP_TIMEOUT}, nil
+	}
 	return &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
@@ -2096,6 +2262,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			return res
 		}
 		res.Message = "Cart permalink failed"
+		_cartErr := ""
+		if err != nil {
+			_cartErr = err.Error()
+			if len(_cartErr) > 120 {
+				_cartErr = _cartErr[:120]
+			}
+		}
+		log.Printf("[DBG cart] base=%s status=%d err=%q hasProxy=%v", baseURL, status, _cartErr, proxyStr != "")
 		atomic.AddInt64(&metrics.CartCreateFails, 1)
 		if proxyStr != "" {
 			res.Proxy = "Dead"
@@ -3715,7 +3889,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v17-flex-repropose"
+const BUILD_VERSION = "v18-h1-tls"
 const RECEIPT_SUPPORT = true
 
 func main() {

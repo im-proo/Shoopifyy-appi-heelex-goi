@@ -1,7 +1,16 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 )
 
 // Typed-path extraction: full proposal body shape.
@@ -98,4 +107,144 @@ func TestSetSubmitSessionTokens(t *testing.T) {
 	}
 	setSubmitSessionTokens(map[string]interface{}{}, "q", "c")
 	setSubmitSessionTokens(map[string]interface{}{"input": 1}, "q", "c")
+}
+
+func TestProxyConnectAuth(t *testing.T) {
+	u, _ := url.Parse("http://user:p%40ss@host:8080")
+	if got := proxyConnectAuth(u); got != "Basic dXNlcjpwQHNz" {
+		t.Errorf("got %q", got)
+	}
+	u2, _ := url.Parse("http://host:8080")
+	if got := proxyConnectAuth(u2); got != "" {
+		t.Errorf("no-creds proxy: got %q", got)
+	}
+	if got := proxyConnectAuth(nil); got != "" {
+		t.Errorf("nil url: got %q", got)
+	}
+}
+
+func TestReadConnectResponse(t *testing.T) {
+	c1, c2 := net.Pipe()
+	go func() {
+		fmt.Fprintf(c2, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		c2.Close()
+	}()
+	if err := readConnectResponse(c1, 1024); err != nil {
+		t.Errorf("200: %v", err)
+	}
+	c1.Close()
+
+	d1, d2 := net.Pipe()
+	go func() {
+		fmt.Fprintf(d2, "HTTP/1.1 403 Forbidden\r\n\r\n")
+		d2.Close()
+	}()
+	if err := readConnectResponse(d1, 1024); err == nil {
+		t.Error("403: want error, got nil")
+	}
+	d1.Close()
+}
+
+// Local CONNECT stub: asserts request shape, answers 200, then echoes.
+func TestConnectTunnel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skip("no loopback")
+	}
+	defer ln.Close()
+	gotReq := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		var hdr []byte
+		one := make([]byte, 1)
+		for !strings.HasSuffix(string(hdr), "\r\n\r\n") && len(hdr) < 4096 {
+			n, err := c.Read(one)
+			if err != nil {
+				return
+			}
+			hdr = append(hdr, one[:n]...)
+		}
+		gotReq <- string(hdr)
+		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		io.Copy(c, c)
+	}()
+	ctx := context.Background()
+	tunnel, err := connectTunnel(ctx, ln.Addr().String(), "target.example:443", "Basic dXNlcjpwYXNz")
+	if err != nil {
+		t.Fatalf("tunnel: %v", err)
+	}
+	defer tunnel.Close()
+	req := <-gotReq
+	if !strings.HasPrefix(req, "CONNECT target.example:443 HTTP/1.1\r\n") {
+		t.Errorf("bad request line: %q", req)
+	}
+	if !strings.Contains(req, "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n") {
+		t.Errorf("missing auth: %q", req)
+	}
+	tunnel.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(tunnel, "ping")
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(tunnel, echo); err != nil || string(echo) != "ping" {
+		t.Errorf("echo: %q %v", echo, err)
+	}
+}
+
+// utls Chrome handshake against a local TLS server (handshake validity,
+// not wall behavior — that only a live canary proves).
+func TestChromeHandshakeLocal(t *testing.T) {
+	srv := httptest.NewTLSServer(nil)
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	raw, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Skip("no loopback")
+	}
+	conn, err := chromeHandshake(context.Background(), raw, u.Hostname())
+	if err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	conn.Close()
+}
+
+// H1 gate flips the direct transport; stock path stays shared + H2.
+func TestH1GateDirect(t *testing.T) {
+	t.Setenv("SHOPAPI_H1_ONLY", "1")
+	t.Setenv("TLS_IMPERSONATE", "")
+	c, err := getProxyClient("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("not *http.Transport")
+	}
+	if tr.ForceAttemptHTTP2 {
+		t.Error("H1 gate on but H2 forced")
+	}
+	if tr == GlobalClient.Transport {
+		t.Error("gated client must not reuse the shared transport")
+	}
+}
+
+// Impersonation arms DialTLSContext and drops Transport.Proxy (no double dial).
+func TestImpersonatedClientBuilds(t *testing.T) {
+	t.Setenv("TLS_IMPERSONATE", "chrome")
+	t.Setenv("SHOPAPI_H1_ONLY", "")
+	for _, p := range []string{"", "http://u:p@127.0.0.1:9", "socks5://u:p@127.0.0.1:1080"} {
+		c, err := getProxyClient(p)
+		if err != nil {
+			t.Fatalf("%q: %v", p, err)
+		}
+		tr := c.Transport.(*http.Transport)
+		if tr.DialTLSContext == nil {
+			t.Errorf("%q: DialTLSContext not armed", p)
+		}
+		if tr.Proxy != nil {
+			t.Errorf("%q: Transport.Proxy must be nil under impersonation", p)
+		}
+	}
 }
