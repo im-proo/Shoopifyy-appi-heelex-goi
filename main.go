@@ -1739,6 +1739,107 @@ func extractSignedHandle(body []byte) string {
 	return fstr(exps, "signedHandle")
 }
 
+// extractPaymentID returns the seller's current paymentMethodIdentifier +
+// gateway name from a proposal or submit body. Sellers may rotate the
+// identifier between proposals, so callers must re-extract from the LATEST
+// body — never reuse a stale copy across retries (else
+// PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH).
+func extractPaymentID(body []byte) (string, string) {
+	var pp struct {
+		Data struct {
+			Session struct {
+				Negotiate struct {
+					Result struct {
+						SellerProposal struct {
+							Payment *struct {
+								AvailablePaymentLines []struct {
+									PaymentMethod map[string]interface{} `json:"paymentMethod"`
+								} `json:"availablePaymentLines"`
+							} `json:"payment"`
+						} `json:"sellerProposal"`
+					} `json:"result"`
+				} `json:"negotiate"`
+			} `json:"session"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &pp) == nil && pp.Data.Session.Negotiate.Result.SellerProposal.Payment != nil {
+		for _, ln := range pp.Data.Session.Negotiate.Result.SellerProposal.Payment.AvailablePaymentLines {
+			if ln.PaymentMethod == nil {
+				continue
+			}
+			id, _ := ln.PaymentMethod["paymentMethodIdentifier"].(string)
+			if id == "" {
+				continue
+			}
+			gw := ""
+			if s, _ := ln.PaymentMethod["extensibilityDisplayName"].(string); s != "" {
+				gw = s
+			} else if s, _ := ln.PaymentMethod["name"].(string); s != "" {
+				gw = s
+			}
+			return id, gw
+		}
+	}
+	if payLines := fastExtract(body, "availablePaymentLines"); payLines != nil {
+		if pm := fastExtract(payLines, "paymentMethod"); pm != nil {
+			id := fstr(pm, "paymentMethodIdentifier")
+			if id != "" {
+				gw := fstr(pm, "extensibilityDisplayName")
+				if gw == "" {
+					gw = fstr(pm, "name")
+				}
+				return id, gw
+			}
+		}
+	}
+	return "", ""
+}
+
+// setSubmitPaymentID writes a rotated paymentMethodIdentifier through to an
+// already-built submitVars. No-op on unexpected shapes — must never crash
+// a retry.
+func setSubmitPaymentID(submitVars map[string]interface{}, pid string) {
+	_in, ok := submitVars["input"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_pay, ok := _in["payment"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_lines, ok := _pay["paymentLines"].([]map[string]interface{})
+	if !ok || len(_lines) == 0 {
+		return
+	}
+	_pm, ok := _lines[0]["paymentMethod"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_dpm, ok := _pm["directPaymentMethod"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_dpm["paymentMethodIdentifier"] = pid
+}
+
+// syncProposalCurrency aligns a proposal variables map to cur: buyerIdentity
+// customer presentmentCurrency plus the concrete taxes value currencyCode
+// when that shape is present (any:true proposal taxes are skipped).
+func syncProposalCurrency(variables map[string]interface{}, cur string) {
+	if _bi, ok := variables["buyerIdentity"].(map[string]interface{}); ok {
+		if _cu, ok := _bi["customer"].(map[string]string); ok {
+			_cu["presentmentCurrency"] = cur
+		}
+	}
+	if _tx, ok := variables["taxes"].(map[string]interface{}); ok {
+		if _pta, ok := _tx["proposedTotalAmount"].(map[string]interface{}); ok {
+			if _v, ok := _pta["value"].(map[string]string); ok {
+				_v["currencyCode"] = cur
+			}
+		}
+	}
+}
+
 // updateMetricsAndDead is called from processCard's defer. It updates
 // atomic counters and marks the store dead when appropriate.
 func updateMetricsAndDead(msg, baseURL string) {
@@ -2228,6 +2329,18 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	if p, err := strconv.ParseFloat(totalPrice, 64); err == nil {
 		res.Price = p
 	}
+	// Seller's presentment currency is authoritative. The checkout scrape
+	// (or the USD default when REST hid the currency) is only a guess —
+	// align now so the FIRST submit already carries the right
+	// buyerIdentity/taxes currency instead of waiting for a rejection.
+	if sc := fstr(fastExtract(sellerBlock(body), "checkoutTotal"), "currencyCode"); sc != "" {
+		sc = strings.ToUpper(strings.TrimSpace(sc))
+		if len(sc) == 3 && sc != currency {
+			currency = sc
+			res.Currency = sc
+			syncProposalCurrency(variables, sc)
+		}
+	}
 
 	deliveryStrategy := func() string {
 		sp := fastExtract(body, "sellerProposal")
@@ -2307,57 +2420,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 
 	signedHandle := extractSignedHandle(body)
 
-	paymentIdentifier := ""
-	gatewayName := ""
-	{
-		var pp struct {
-			Data struct {
-				Session struct {
-					Negotiate struct {
-						Result struct {
-							SellerProposal struct {
-								Payment *struct {
-									AvailablePaymentLines []struct {
-										PaymentMethod map[string]interface{} `json:"paymentMethod"`
-									} `json:"availablePaymentLines"`
-								} `json:"payment"`
-							} `json:"sellerProposal"`
-						} `json:"result"`
-					} `json:"negotiate"`
-				} `json:"session"`
-			} `json:"data"`
-		}
-		if json.Unmarshal(body, &pp) == nil && pp.Data.Session.Negotiate.Result.SellerProposal.Payment != nil {
-			for _, ln := range pp.Data.Session.Negotiate.Result.SellerProposal.Payment.AvailablePaymentLines {
-				if ln.PaymentMethod == nil {
-					continue
-				}
-				id, _ := ln.PaymentMethod["paymentMethodIdentifier"].(string)
-				if id == "" {
-					continue
-				}
-				paymentIdentifier = id
-				if s, _ := ln.PaymentMethod["extensibilityDisplayName"].(string); s != "" {
-					gatewayName = s
-				} else if s, _ := ln.PaymentMethod["name"].(string); s != "" {
-					gatewayName = s
-				}
-				break
-			}
-		}
-
-		if paymentIdentifier == "" {
-			if payLines := fastExtract(body, "availablePaymentLines"); payLines != nil {
-				if pm := fastExtract(payLines, "paymentMethod"); pm != nil {
-					paymentIdentifier = fstr(pm, "paymentMethodIdentifier")
-					gatewayName = fstr(pm, "extensibilityDisplayName")
-					if gatewayName == "" {
-						gatewayName = fstr(pm, "name")
-					}
-				}
-			}
-		}
-	}
+	paymentIdentifier, gatewayName := extractPaymentID(body)
 	if gatewayName != "" {
 		res.Gateway = gatewayName
 	}
@@ -2446,6 +2509,24 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	if tf := fstr(body, "transformerFingerprintV2"); tf != "" {
 		transformerFP = tf
 	}
+	// Delivery-confirm overwrote body: the seller may have rotated the
+	// payment identifier or confirmed a different presentment currency.
+	// Re-extract both before building submitVars.
+	if pid, gw := extractPaymentID(body); pid != "" {
+		paymentIdentifier = pid
+		if gw != "" {
+			gatewayName = gw
+			res.Gateway = gw
+		}
+	}
+	if sc := fstr(fastExtract(sellerBlock(body), "checkoutTotal"), "currencyCode"); sc != "" {
+		sc = strings.ToUpper(strings.TrimSpace(sc))
+		if len(sc) == 3 && sc != currency {
+			currency = sc
+			res.Currency = sc
+			syncProposalCurrency(variables, sc)
+		}
+	}
 
 	// Seller's presentment currency (filled inside refreshProposal) — if
 	// submit later fails with a currency-mismatch code, the retry loop
@@ -2494,6 +2575,23 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		// Seller's presentment currency — captured into outer sellerCurrency.
 		if sc := fstr(fastExtract(sellerBlock(body), "checkoutTotal"), "currencyCode"); sc != "" {
 			sellerCurrency = sc
+		}
+		// A refreshed proposal may rotate the payment identifier or settle
+		// on the presentment currency: adopt both so the submit uses them.
+		if pid, gw := extractPaymentID(body); pid != "" {
+			paymentIdentifier = pid
+			if gw != "" {
+				gatewayName = gw
+				res.Gateway = gw
+			}
+		}
+		if sellerCurrency != "" {
+			_sc := strings.ToUpper(strings.TrimSpace(sellerCurrency))
+			if len(_sc) == 3 && _sc != currency {
+				currency = _sc
+				res.Currency = _sc
+				syncProposalCurrency(variables, _sc)
+			}
 		}
 		if ta := fstr(fastExtract(sellerBlock(body), "tax"), "amount"); ta != "" {
 			taxAmount = ta
@@ -2903,6 +3001,23 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 						_cu["presentmentCurrency"] = sellerCurrency
 					}
 				}
+				syncProposalCurrency(variables, sellerCurrency)
+				break
+			}
+		}
+		// Rotated payment identifier: the seller's latest sellerProposal is
+		// authoritative. Handled standalone (not inside rejectNeedsTermAccept,
+		// whose matcher does not fire for this code alone).
+		for _, _c := range errCodes {
+			if strings.Contains(_c, "FLEXIBILITY") {
+				if pid, gw := extractPaymentID(body); pid != "" && pid != paymentIdentifier {
+					paymentIdentifier = pid
+					if gw != "" {
+						gatewayName = gw
+						res.Gateway = gw
+					}
+					setSubmitPaymentID(submitVars, pid)
+				}
 				break
 			}
 		}
@@ -2926,6 +3041,16 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 			if tf := fstr(sellerRej, "transformerFingerprintV2"); tf != "" {
 				transformerFP = tf
+			}
+			// Accepted new terms may rotate the payment identifier: adopt
+			// the latest and write it through to the next submit.
+			if pid, gw := extractPaymentID(body); pid != "" && pid != paymentIdentifier {
+				paymentIdentifier = pid
+				if gw != "" {
+					gatewayName = gw
+					res.Gateway = gw
+				}
+				setSubmitPaymentID(submitVars, pid)
 			}
 			dl := submitVars["input"].(map[string]interface{})["delivery"].(map[string]interface{})
 			if lines, ok := dl["deliveryLines"].([]map[string]interface{}); ok && len(lines) > 0 {
@@ -3573,7 +3698,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v15-addrbook"
+const BUILD_VERSION = "v16-flex-currency"
 const RECEIPT_SUPPORT = true
 
 func main() {
