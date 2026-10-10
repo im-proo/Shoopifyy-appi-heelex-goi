@@ -300,7 +300,7 @@ var Book = map[string]Address{
 }
 
 // pickAddrByURL: secondary fallback. Two-part TLD check first.
-func pickAddrByURL(siteURL string) Address {
+func pickAddrByURL(siteURL string) (Address, bool) {
 	u, err := url.Parse(normalizeDomain(siteURL))
 	if err == nil {
 		host := strings.ToUpper(u.Hostname())
@@ -315,7 +315,7 @@ func pickAddrByURL(siteURL string) Address {
 			two := parts[len(parts)-2] + "." + parts[len(parts)-1]
 			if cc, ok := twoPartMap[two]; ok {
 				if addr, ok := Book[cc]; ok {
-					return addr
+					return addr, true
 				}
 			}
 		}
@@ -323,11 +323,11 @@ func pickAddrByURL(siteURL string) Address {
 		if len(parts) > 0 {
 			tld := parts[len(parts)-1]
 			if addr, ok := Book[tld]; ok {
-				return addr
+				return addr, true
 			}
 		}
 	}
-	return Book["DEFAULT"]
+	return Book["DEFAULT"], false
 }
 
 // pickAddrByCurrency: primary address selection after variant fetch.
@@ -1423,10 +1423,18 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		log.Printf("[AUTO] Found variant %s ($%.2f %s, shipping=%v) for %s", vid, price, cur, shipping, baseURL)
 	}
 
-	// Address: prefer currency-based (accurate), fall back to URL-based.
-	addr := pickAddrByURL(baseURL)
+	// Address split (AVS-correct): BILLING follows the card side
+	// (currency), DELIVERY follows the store side — but ONLY when the store
+	// domain actually maps to a country (ccTLD/custom domains). Bare
+	// myshopify.com subdomains carry no locale signal, so delivery falls
+	// back to the billing address there (previous behavior, unchanged).
+	addr, _ := pickAddrByURL(baseURL)
+	shipAddr, shipOK := pickAddrByURL(baseURL)
 	if a, ok := pickAddrByCurrency(res.Currency); ok {
 		addr = a
+	}
+	if !shipOK || shipAddr.CountryCode == "" {
+		shipAddr = addr
 	}
 	fName, lName := getRandName()
 	email := genEmail(fName, lName)
@@ -1660,6 +1668,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			"company": fName + " " + lName,
 		},
 	}
+	// Delivery destination follows the STORE side (shipAddr); billing stays
+	// on the card side. Same person/phone, store-locale street address.
+	shipStreet := map[string]string{
+		"address1": shipAddr.Address1, "city": shipAddr.City, "countryCode": shipAddr.CountryCode,
+		"postalCode": shipAddr.PostalCode, "firstName": fName, "lastName": lName,
+		"zoneCode": shipAddr.ZoneCode, "phone": phoneE164,
+		"company": fName + " " + lName,
+	}
 
 	// Delivery terms: SHIPPING for physical goods, noDeliveryRequired for digital.
 	var deliveryVars map[string]interface{}
@@ -1667,7 +1683,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		deliveryVars = map[string]interface{}{
 			"deliveryLines": []map[string]interface{}{{
 				"destination": map[string]interface{}{
-					"partialStreetAddress": billingAddr["streetAddress"],
+					"partialStreetAddress": shipStreet,
 				},
 				"selectedDeliveryStrategy": map[string]interface{}{
 					"deliveryStrategyMatchingConditions": map[string]interface{}{
@@ -2178,7 +2194,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		submitVars["input"].(map[string]interface{})["delivery"] = map[string]interface{}{
 			"deliveryLines": []map[string]interface{}{{
 				"destination": map[string]interface{}{
-					"streetAddress": billingAddr["streetAddress"],
+					"streetAddress": shipStreet,
 				},
 				"selectedDeliveryStrategy": map[string]interface{}{
 					"deliveryStrategyByHandle": map[string]interface{}{
@@ -2284,6 +2300,11 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			} else {
 				_sa["phone"] = _p
 			}
+		}
+		if _p == "" {
+			delete(shipStreet, "phone")
+		} else {
+			shipStreet["phone"] = _p
 		}
 		if _inMap, _ok := submitVars["input"].(map[string]interface{}); _ok {
 			if _dl, _ok := _inMap["delivery"].(map[string]interface{}); _ok {
