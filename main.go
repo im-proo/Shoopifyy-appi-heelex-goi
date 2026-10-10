@@ -594,11 +594,14 @@ func randomizedPhones(addr Address) (string, string, string) {
 	} else {
 		n = len(bookDigits)
 	}
-	if n <= 0 {
-		return "", "", ""
-	}
+	// Preferred length from the research table — must be consulted BEFORE
+	// the n<=0 bail so rows with an empty Phone field (v15 BookMulti) still
+	// generate a full number.
 	if nl, ok := nationalLengths[addr.CountryCode]; ok && nl > 0 {
 		n = nl
+	}
+	if n <= 0 {
+		return "", "", ""
 	}
 	gen := randNationalDigits(n, addr.CountryCode)
 	return "+" + dial + gen, gen, "+" + dial + " " + gen
@@ -739,7 +742,7 @@ func pickAddrByURL(siteURL string) (Address, bool) {
 		if len(parts) >= 2 {
 			two := parts[len(parts)-2] + "." + parts[len(parts)-1]
 			if cc, ok := twoPartMap[two]; ok {
-				if addr, ok := Book[cc]; ok {
+				if addr, ok := addrFor(cc); ok {
 					return addr, true
 				}
 			}
@@ -747,7 +750,7 @@ func pickAddrByURL(siteURL string) (Address, bool) {
 
 		if len(parts) > 0 {
 			tld := parts[len(parts)-1]
-			if addr, ok := Book[tld]; ok {
+			if addr, ok := addrFor(tld); ok {
 				return addr, true
 			}
 		}
@@ -762,7 +765,7 @@ func pickAddrByCurrency(currency string) (Address, bool) {
 	if !ok {
 		return Book["DEFAULT"], false
 	}
-	if addr, ok := Book[cc]; ok {
+	if addr, ok := addrFor(cc); ok {
 		return addr, true
 	}
 	return Book["DEFAULT"], false
@@ -1884,6 +1887,13 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			phoneNatLen = len(_bd) - len(_d)
 		} else {
 			phoneNatLen = len(_bd)
+		}
+		// Empty Phone field (rotating BookMulti rows) — length comes from
+		// the research table so PHONE remedies can still regenerate digits.
+		if phoneNatLen <= 0 {
+			if _nl, _ok2 := nationalLengths[addr.CountryCode]; _ok2 && _nl > 0 {
+				phoneNatLen = _nl
+			}
 		}
 	}
 	regenPhones := func() {
@@ -3563,7 +3573,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v12-receipt"
+const BUILD_VERSION = "v15-addrbook"
 const RECEIPT_SUPPORT = true
 
 func main() {
