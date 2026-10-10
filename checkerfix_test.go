@@ -92,6 +92,17 @@ func TestSyncProposalCurrency(t *testing.T) {
 	}
 }
 
+// Proposal query must expose the seller's payment flexibility template
+// (read-only visibility for FLEXIBILITY_MISMATCH tracing).
+func TestProposalQueryFlexVisibility(t *testing.T) {
+	if !strings.Contains(QUERY_PROPOSAL, "paymentFlexibilityPaymentTermsTemplate{") {
+		t.Error("QUERY_PROPOSAL missing paymentFlexibilityPaymentTermsTemplate selection")
+	}
+	if !strings.Contains(QUERY_PROPOSAL, "depositConfiguration{") {
+		t.Error("QUERY_PROPOSAL missing depositConfiguration selection")
+	}
+}
+
 // Session-token write-through must land on input.queueToken/checkpointData
 // and never panic on bad shapes.
 func TestSetSubmitSessionTokens(t *testing.T) {
