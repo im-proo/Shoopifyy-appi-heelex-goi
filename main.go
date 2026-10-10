@@ -535,6 +535,8 @@ func randNationalDigits(n int, country string) string {
 	for t := 0; t < 25; t++ {
 		gen = ""
 		if len(plist) > 0 {
+			// Researched prefix used verbatim (151, 130, 10x… are valid
+			// despite starting with 1 — no first-digit fixup here).
 			p := plist[rand.Intn(len(plist))]
 			if len(p) >= n {
 				gen = p[:n]
@@ -545,9 +547,6 @@ func randNationalDigits(n int, country string) string {
 					sb.WriteByte(byte('0' + rand.Intn(10)))
 				}
 				gen = sb.String()
-			}
-			if gen[0] < '2' || gen[0] > '9' {
-				gen = string(rune('2'+rand.Intn(8))) + gen[1:]
 			}
 		} else {
 			for i := 0; i < n; i++ {
