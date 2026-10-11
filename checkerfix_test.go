@@ -300,3 +300,19 @@ func TestPinnedVariant(t *testing.T) {
 		t.Errorf("unknown store pin = %q, want empty", got)
 	}
 }
+
+// sellerCurrencyFrom reads checkoutTotal.currencyCode from proposal or
+// submit-rejection bodies; empty when the seller published none.
+func TestSellerCurrencyFrom(t *testing.T) {
+	prop := []byte(`{"data":{"session":{"negotiate":{"result":{"sellerProposal":{"checkoutTotal":{"value":{"amount":"12.00","currencyCode":"EUR"}}}}}}}}`)
+	if got := sellerCurrencyFrom(prop); got != "EUR" {
+		t.Errorf("proposal: got %q, want EUR", got)
+	}
+	rej := []byte(`{"data":{"submitForCompletion":{"sellerProposal":{"checkoutTotal":{"value":{"amount":"5.00","currencyCode":"gbp"}}}}}}`)
+	if got := sellerCurrencyFrom(rej); got != "GBP" {
+		t.Errorf("rejection: got %q, want GBP", got)
+	}
+	if got := sellerCurrencyFrom([]byte(`{"data":{}}`)); got != "" {
+		t.Errorf("absent: got %q, want empty", got)
+	}
+}

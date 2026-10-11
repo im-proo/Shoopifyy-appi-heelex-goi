@@ -2029,6 +2029,17 @@ func ensureAddress2(billingAddr map[string]interface{}, shipStreet map[string]st
 	}
 }
 
+// sellerCurrencyFrom reads the seller's presentment currency out of any
+// negotiation/submit body via its checkoutTotal. Empty when absent.
+func sellerCurrencyFrom(body []byte) string {
+	sc := fstr(fastExtract(sellerBlock(body), "checkoutTotal"), "currencyCode")
+	sc = strings.ToUpper(strings.TrimSpace(sc))
+	if len(sc) == 3 {
+		return sc
+	}
+	return ""
+}
+
 // syncProposalCurrency aligns a proposal variables map to cur: buyerIdentity
 // customer presentmentCurrency plus the concrete taxes value currencyCode
 // when that shape is present (any:true proposal taxes are skipped).
@@ -3285,17 +3296,28 @@ acquireVariant:
 			break
 		}
 		for _, _c := range errCodes {
-			if (strings.Contains(_c, "PRESENTMENT_CURRENCY") || strings.Contains(_c, "CURRENCY_NOT_SUPPORTED")) && sellerCurrency != "" && sellerCurrency != currency {
-				currency = sellerCurrency
-				res.Currency = sellerCurrency
+			if !(strings.Contains(_c, "PRESENTMENT_CURRENCY") || strings.Contains(_c, "CURRENCY_NOT_SUPPORTED")) {
+				continue
+			}
+			// Prefer the tracked seller currency; last resort is the
+			// rejection body itself, which usually carries the seller's
+			// checkoutTotal with its currencyCode even when no proposal did.
+			_sc := sellerCurrency
+			if _sc == "" {
+				_sc = sellerCurrencyFrom(body)
+			}
+			if _sc != "" && _sc != currency {
+				currency = _sc
+				res.Currency = _sc
+				sellerCurrency = _sc
 				if _bi, ok := submitVars["input"].(map[string]interface{})["buyerIdentity"].(map[string]interface{}); ok {
 					if _cu, ok := _bi["customer"].(map[string]string); ok {
-						_cu["presentmentCurrency"] = sellerCurrency
+						_cu["presentmentCurrency"] = _sc
 					}
 				}
-				syncProposalCurrency(variables, sellerCurrency)
-				break
+				syncProposalCurrency(variables, _sc)
 			}
+			break
 		}
 		// Flexibility terms are bound to the negotiation session: a rotated
 		// payment ID alone is not enough — re-negotiate for a current
@@ -3996,7 +4018,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v22-pinned-variants"
+const BUILD_VERSION = "v23-currency-reject"
 const RECEIPT_SUPPORT = true
 
 func main() {
