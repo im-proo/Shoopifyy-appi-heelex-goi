@@ -2796,14 +2796,10 @@ acquireVariant:
 		res.Message = "No valid payment method found"
 		return res
 	}
-	// Shopify-gateway policy: when the seller's lines are identified and
-	// none is Shopify Payments, skip the submit burn (bot moves on).
-	// Unknown (nameless identifier lines) never triggers the skip.
-	if hasSP, absent, names := shopifyPaymentsPresent(body); !hasSP && absent {
-		log.Printf("[SKIP] no Shopify Payments on %s (methods: %s)", baseURL, names)
-		res.Message = "NO_SHOPIFY_PAYMENTS"
-		return res
-	}
+	// NOTE: no gateway skip here. Non-Shopify-Payments card rails
+	// (authorize.net and friends) produce real charges with receipts, so
+	// every identified method is submittable. The SP preference above
+	// already selects the best rail when several exist.
 
 	taxAmount := "0"
 	// _taxFresh tracks whether taxAmount came from a detailed seller block
@@ -4130,7 +4126,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v25-shopify-gateway"
+const BUILD_VERSION = "v26-all-gateways"
 const RECEIPT_SUPPORT = true
 
 func main() {
