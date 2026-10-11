@@ -1921,6 +1921,14 @@ func extractSignedHandle(body []byte) string {
 	return fstr(exps, "signedHandle")
 }
 
+// needsReproposal reports whether a submit error code means the payment
+// session itself went stale (flexibility rotation or bare payment-method
+// mismatch): only a fresh proposal gives current terms. Anything else
+// keeps the existing remedy path.
+func needsReproposal(code string) bool {
+	return strings.Contains(code, "FLEXIBILITY") || code == "PAYMENTS_METHOD"
+}
+
 // extractPaymentID returns the seller's current paymentMethodIdentifier +
 // gateway name from a proposal or submit body. Sellers may rotate the
 // identifier between proposals, so callers must re-extract from the LATEST
@@ -3438,10 +3446,11 @@ acquireVariant:
 		// Flexibility terms are bound to the negotiation session: a rotated
 		// payment ID alone is not enough — re-negotiate for a current
 		// checkpoint/queueToken, then resubmit against the fresh session.
-		// Handled standalone (rejectNeedsTermAccept does not fire for this
-		// code alone). Reactive only: cards already terminal with this code.
+		// Same treatment for bare PAYMENTS_METHOD (identical never-converges
+		// shape). Handled standalone (rejectNeedsTermAccept does not fire
+		// for FLEXIBILITY alone). Reactive only.
 		for _, _c := range errCodes {
-			if strings.Contains(_c, "FLEXIBILITY") {
+			if needsReproposal(_c) {
 				_oldPid := paymentIdentifier
 				refreshProposal()
 				setSubmitSessionTokens(submitVars, queueToken, checkpointData)
@@ -3453,7 +3462,7 @@ acquireVariant:
 					}
 					setSubmitPaymentID(submitVars, pid)
 				}
-				log.Printf("[DBG flex] cc=%s base=%s pidChanged=%v queueTokenLen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, paymentIdentifier != _oldPid, len(queueToken))
+				log.Printf("[DBG flex] cc=%s base=%s code=%q pidChanged=%v queueTokenLen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, _c, paymentIdentifier != _oldPid, len(queueToken))
 				break
 			}
 		}
@@ -4126,7 +4135,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v26-all-gateways"
+const BUILD_VERSION = "v27-payments-method"
 const RECEIPT_SUPPORT = true
 
 func main() {

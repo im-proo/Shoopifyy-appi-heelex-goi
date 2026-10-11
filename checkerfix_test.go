@@ -370,3 +370,18 @@ func TestShopifyPaymentsPresent(t *testing.T) {
 		t.Errorf("empty case: hasSP=%v absent=%v", hasSP, absent)
 	}
 }
+
+// needsReproposal fires on flexibility rotation and bare payment-method
+// mismatch — both never-converging session states — and nothing else.
+func TestNeedsReproposal(t *testing.T) {
+	for _, c := range []string{"PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH", "PAYMENTS_METHOD"} {
+		if !needsReproposal(c) {
+			t.Errorf("%q should trigger re-proposal", c)
+		}
+	}
+	for _, c := range []string{"TAX_NEW_TAX_MUST_BE_ACCEPTED", "WAITING_PENDING_TERMS", "DELIVERY_NO_DELIVERY_STRATEGY_AVAILABLE", "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", ""} {
+		if needsReproposal(c) {
+			t.Errorf("%q must NOT trigger re-proposal", c)
+		}
+	}
+}
