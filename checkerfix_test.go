@@ -319,21 +319,30 @@ func TestSellerCurrencyFrom(t *testing.T) {
 
 // receiptURL prefers the order-status page, then redirect, confirmation,
 // and post-purchase URLs; nulls and empties never win.
+func TestReceiptTransient(t *testing.T) {
+	if !receiptTransient("https://x/checkouts/sessions/checkout-completion/redirect?_t=abc") {
+		t.Error("sessions handoff must flag transient")
+	}
+	if receiptTransient("https://store.com/checkouts/order-status-page/xyz") {
+		t.Error("order page must not flag transient")
+	}
+}
+
 func TestReceiptURL(t *testing.T) {
 	full := []byte(`{"data":{"submitForCompletion":{"receipt":{"__typename":"ProcessedReceipt","orderStatusPageUrl":"https://s/o1","redirectUrl":"https://s/r1","confirmationPage":{"url":"https://s/c1"}}}}}`)
-	if got := receiptURL(full); got != "https://s/o1" {
+	if got, src := receiptURL(full); got != "https://s/o1" || src != "orderStatusPageUrl" {
 		t.Errorf("prefer status page: %q", got)
 	}
 	redirOnly := []byte(`{"data":{"receipt":{"__typename":"ProcessedReceipt","orderStatusPageUrl":null,"redirectUrl":"https://s/r2"}}}`)
-	if got := receiptURL(redirOnly); got != "https://s/r2" {
+	if got, src := receiptURL(redirOnly); got != "https://s/r2" || src != "redirectUrl" {
 		t.Errorf("redirect fallback: %q", got)
 	}
 	confirmOnly := []byte(`{"data":{"receipt":{"__typename":"ProcessedReceipt","orderStatusPageUrl":null,"redirectUrl":null,"confirmationPage":{"url":"https://s/c3"}}}}}`)
-	if got := receiptURL(confirmOnly); got != "https://s/c3" {
+	if got, src := receiptURL(confirmOnly); got != "https://s/c3" || src != "confirmationPage" {
 		t.Errorf("confirmation fallback: %q", got)
 	}
 	empty := []byte(`{"data":{"receipt":{"__typename":"ProcessedReceipt","orderStatusPageUrl":null,"redirectUrl":null}}}`)
-	if got := receiptURL(empty); got != "" {
+	if got, src := receiptURL(empty); got != "" || src != "none" {
 		t.Errorf("both null: got %q, want empty", got)
 	}
 }

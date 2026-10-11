@@ -2113,28 +2113,36 @@ func ensureAddress2(billingAddr map[string]interface{}, shipStreet map[string]st
 }
 
 // receiptURL extracts the order proof link from a receipt-bearing body.
-// Chain: guest order-status page → redirect URL → confirmation page URL →
-// post-purchase page. "null" literals and empties are skipped: a charge
-// must never log a dead proof link.
-func receiptURL(body []byte) string {
+// Returns url + source key. Chain: guest order-status page → redirect URL
+// → confirmation page URL → post-purchase page. "null" literals and empties
+// are skipped: a charge must never log a dead proof link.
+func receiptURL(body []byte) (string, string) {
 	blk := fastExtract(body, "receipt")
 	if blk == nil {
 		blk = body
 	}
 	for _, key := range []string{"orderStatusPageUrl", "redirectUrl"} {
 		if u := fstr(blk, key); u != "" && u != "null" {
-			return u
+			return u, key
 		}
 	}
 	if cp := fastExtract(blk, "confirmationPage"); cp != nil {
 		if u := fstr(cp, "url"); u != "" && u != "null" {
-			return u
+			return u, "confirmationPage"
 		}
 	}
 	if u := fstr(blk, "postPurchasePageUrl"); u != "" && u != "null" {
-		return u
+		return u, "postPurchasePageUrl"
 	}
-	return ""
+	return "", "none"
+}
+
+// receiptTransient reports whether a proof link is a short-lived session
+// handoff (dies with the session — looks "fake" when opened later) rather
+// than a durable order page.
+func receiptTransient(url string) bool {
+	return strings.Contains(url, "/checkouts/sessions/") ||
+		strings.Contains(url, "checkout-completion")
 }
 
 // sellerCurrencyFrom reads the seller's presentment currency out of any
@@ -3642,7 +3650,9 @@ acquireVariant:
 			res.Message = "ORDER_PAID"
 			// Prefer the guest order-status page (publicly verifiable proof
 			// of charge); fall back down the receiptURL chain when absent.
-			res.Redirect = receiptURL(body)
+			_url, _src := receiptURL(body)
+			res.Redirect = _url
+			log.Printf("[DBG receipt] base=%s source=%s transient=%v", baseURL, _src, receiptTransient(_url))
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
 		} else if receiptType == "ActionRequiredReceipt" {
@@ -3718,7 +3728,9 @@ acquireVariant:
 		if pollType == "ProcessedReceipt" {
 			res.Success = true
 			res.Message = "ORDER_PAID"
-			res.Redirect = receiptURL(body)
+			_url, _src := receiptURL(body)
+			res.Redirect = _url
+			log.Printf("[DBG receipt] base=%s source=%s transient=%v", baseURL, _src, receiptTransient(_url))
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
 		} else if pollType == "FailedReceipt" {
@@ -4135,7 +4147,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v27-payments-method"
+const BUILD_VERSION = "v28-receipt-source"
 const RECEIPT_SUPPORT = true
 
 func main() {
