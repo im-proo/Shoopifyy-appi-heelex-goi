@@ -337,3 +337,36 @@ func TestReceiptURL(t *testing.T) {
 		t.Errorf("both null: got %q, want empty", got)
 	}
 }
+
+// Preference: shopify_payments line wins even when sorted second.
+func TestExtractPaymentIDPrefersShopifyPayments(t *testing.T) {
+	body := []byte(`{"data":{"session":{"negotiate":{"result":{"sellerProposal":{"payment":{"availablePaymentLines":[{"paymentMethod":{"paymentMethodIdentifier":"gid-RAZOR","name":"razorpay"}},{"paymentMethod":{"paymentMethodIdentifier":"gid-SP","name":"shopify_payments","extensibilityDisplayName":"Shopify Payments"}}]}}}}}}}`)
+	id, _ := extractPaymentID(body)
+	if id != "gid-SP" {
+		t.Errorf("got %q, want gid-SP", id)
+	}
+}
+
+// Classifier: present / confirmed-absent / unknown / empty.
+func TestShopifyPaymentsPresent(t *testing.T) {
+	sp := []byte(`{"data":{"session":{"negotiate":{"result":{"sellerProposal":{"payment":{"availablePaymentLines":[{"paymentMethod":{"paymentMethodIdentifier":"gid-SP","name":"shopify_payments"}}]}}}}}}}`)
+	if hasSP, absent, _ := shopifyPaymentsPresent(sp); !hasSP || absent {
+		t.Errorf("present case: hasSP=%v absent=%v", hasSP, absent)
+	}
+	offsite := []byte(`{"data":{"session":{"negotiate":{"result":{"sellerProposal":{"payment":{"availablePaymentLines":[{"paymentMethod":{"paymentMethodIdentifier":"gid-RZ","name":"razorpay"}}]}}}}}}}`)
+	if hasSP, absent, _ := shopifyPaymentsPresent(offsite); hasSP || !absent {
+		t.Errorf("absent case: hasSP=%v absent=%v", hasSP, absent)
+	}
+	nameless := []byte(`{"data":{"session":{"negotiate":{"result":{"sellerProposal":{"payment":{"availablePaymentLines":[{"paymentMethod":{"paymentMethodIdentifier":"gid-DIRECT"}}]}}}}}}}`)
+	if hasSP, absent, _ := shopifyPaymentsPresent(nameless); hasSP || absent {
+		t.Errorf("unknown case must proceed, never skip: hasSP=%v absent=%v", hasSP, absent)
+	}
+	mixed := []byte(`{"data":{"session":{"negotiate":{"result":{"sellerProposal":{"payment":{"availablePaymentLines":[{"paymentMethod":{"paymentMethodIdentifier":"gid-RZ","name":"razorpay"}},{"paymentMethod":{"paymentMethodIdentifier":"gid-DIRECT"}}]}}}}}}}`)
+	if hasSP, absent, _ := shopifyPaymentsPresent(mixed); hasSP || absent {
+		t.Errorf("mixed named+nameless must proceed: hasSP=%v absent=%v", hasSP, absent)
+	}
+	empty := []byte(`{"data":{}}`)
+	if hasSP, absent, _ := shopifyPaymentsPresent(empty); hasSP || absent {
+		t.Errorf("empty case: hasSP=%v absent=%v", hasSP, absent)
+	}
+}

@@ -1945,6 +1945,7 @@ func extractPaymentID(body []byte) (string, string) {
 		} `json:"data"`
 	}
 	if json.Unmarshal(body, &pp) == nil && pp.Data.Session.Negotiate.Result.SellerProposal.Payment != nil {
+		firstID, firstGW := "", ""
 		for _, ln := range pp.Data.Session.Negotiate.Result.SellerProposal.Payment.AvailablePaymentLines {
 			if ln.PaymentMethod == nil {
 				continue
@@ -1959,7 +1960,21 @@ func extractPaymentID(body []byte) (string, string) {
 			} else if s, _ := ln.PaymentMethod["name"].(string); s != "" {
 				gw = s
 			}
-			return id, gw
+			if firstID == "" {
+				firstID, firstGW = id, gw
+			}
+			// Shopify Payments rail wins over any other method: charges
+			// must go through the shopify gateway, never a wallet/BNPL or
+			// regional line that happens to sort first.
+			if n, _ := ln.PaymentMethod["name"].(string); n == "shopify_payments" {
+				return id, gw
+			}
+			if e, _ := ln.PaymentMethod["extensibilityDisplayName"].(string); e == "Shopify Payments" {
+				return id, gw
+			}
+		}
+		if firstID != "" {
+			return firstID, firstGW
 		}
 	}
 	if payLines := fastExtract(body, "availablePaymentLines"); payLines != nil {
@@ -1975,6 +1990,66 @@ func extractPaymentID(body []byte) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+// shopifyPaymentsPresent classifies the seller's payment lines for the
+// shopify-gateway policy. Returns (hasSP, confirmedAbsent, names): hasSP
+// when a shopify_payments line is visible; confirmedAbsent only when every
+// identified line is visibly non-SP. Nameless identifier lines
+// (DirectPaymentMethod and uncovered types carry no name) force UNKNOWN —
+// never absence — so working card rails are never skipped.
+func shopifyPaymentsPresent(body []byte) (bool, bool, string) {
+	var pp struct {
+		Data struct {
+			Session struct {
+				Negotiate struct {
+					Result struct {
+						SellerProposal struct {
+							Payment *struct {
+								AvailablePaymentLines []struct {
+									PaymentMethod map[string]interface{} `json:"paymentMethod"`
+								} `json:"availablePaymentLines"`
+							} `json:"payment"`
+						} `json:"sellerProposal"`
+					} `json:"result"`
+				} `json:"negotiate"`
+			} `json:"session"`
+		} `json:"data"`
+	}
+	names := []string{}
+	if json.Unmarshal(body, &pp) == nil && pp.Data.Session.Negotiate.Result.SellerProposal.Payment != nil {
+		namedNonSP, namelessID := false, false
+		for _, ln := range pp.Data.Session.Negotiate.Result.SellerProposal.Payment.AvailablePaymentLines {
+			if ln.PaymentMethod == nil {
+				continue
+			}
+			id, _ := ln.PaymentMethod["paymentMethodIdentifier"].(string)
+			if id == "" {
+				continue
+			}
+			n, _ := ln.PaymentMethod["name"].(string)
+			e, _ := ln.PaymentMethod["extensibilityDisplayName"].(string)
+			if n == "shopify_payments" || e == "Shopify Payments" {
+				return true, false, strings.Join(names, ",")
+			}
+			if n == "" {
+				n = e
+			}
+			if n != "" {
+				namedNonSP = true
+				names = append(names, n)
+			} else {
+				namelessID = true
+			}
+		}
+		// Confirmed absent only when every identified line is visibly
+		// non-SP. Any nameless identifier line means UNKNOWN (Direct-
+		// PaymentMethod and uncovered types carry no name) — proceed.
+		if namedNonSP && !namelessID {
+			return false, true, strings.Join(names, ",")
+		}
+	}
+	return false, false, ""
 }
 
 // setSubmitPaymentID writes a rotated paymentMethodIdentifier through to an
@@ -2610,6 +2685,9 @@ acquireVariant:
 	if p, err := strconv.ParseFloat(totalPrice, 64); err == nil {
 		res.Price = p
 	}
+	// Live flexibility template (empty unless the seller published payment
+	// flexibility terms). Drives flex-first re-proposal before submit.
+	flexID := ""
 	// Seller's presentment currency is authoritative. The checkout scrape
 	// (or the USD default when REST hid the currency) is only a guess —
 	// align now so the FIRST submit already carries the right
@@ -2627,8 +2705,9 @@ acquireVariant:
 	// store that later fails FLEXIBILITY_MISMATCH confirms the seller rotated
 	// terms mid-session (the v17 re-propose covers it). The submit-side echo
 	// stays parked until the input field is confirmed — no guessing.
-	if flexID := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); flexID != "" {
-		log.Printf("[DBG flex-template] base=%s id=%q", baseURL, flexID)
+	if _fid := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); _fid != "" {
+		flexID = _fid
+		log.Printf("[DBG flex-template] base=%s id=%q", baseURL, _fid)
 	}
 
 	deliveryStrategy := func() string {
@@ -2715,6 +2794,14 @@ acquireVariant:
 	}
 	if paymentIdentifier == "" {
 		res.Message = "No valid payment method found"
+		return res
+	}
+	// Shopify-gateway policy: when the seller's lines are identified and
+	// none is Shopify Payments, skip the submit burn (bot moves on).
+	// Unknown (nameless identifier lines) never triggers the skip.
+	if hasSP, absent, names := shopifyPaymentsPresent(body); !hasSP && absent {
+		log.Printf("[SKIP] no Shopify Payments on %s (methods: %s)", baseURL, names)
+		res.Message = "NO_SHOPIFY_PAYMENTS"
 		return res
 	}
 
@@ -2821,8 +2908,9 @@ acquireVariant:
 	// store that later fails FLEXIBILITY_MISMATCH confirms the seller rotated
 	// terms mid-session (the v17 re-propose covers it). The submit-side echo
 	// stays parked until the input field is confirmed — no guessing.
-	if flexID := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); flexID != "" {
-		log.Printf("[DBG flex-template] base=%s id=%q", baseURL, flexID)
+	if _fid := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); _fid != "" {
+		flexID = _fid
+		log.Printf("[DBG flex-template] base=%s id=%q", baseURL, _fid)
 	}
 
 	// Seller's presentment currency (filled inside refreshProposal) — if
@@ -2948,6 +3036,13 @@ acquireVariant:
 		},
 		"payment_session_scope": u.Host,
 	})
+	if flexID != "" {
+		// Flex-active store: open with a fresh session instead of
+		// submitting against terms about to rotate (saves doomed
+		// submits; refreshProposal adopts tokens, payment ID, currency).
+		log.Printf("[DBG flex-first] base=%s template=%q", baseURL, flexID)
+		refreshProposal()
+	}
 
 	pciHeaders := map[string]string{
 		"Content-Type": "application/json",
@@ -4035,7 +4130,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v24-receipt-urls"
+const BUILD_VERSION = "v25-shopify-gateway"
 const RECEIPT_SUPPORT = true
 
 func main() {
