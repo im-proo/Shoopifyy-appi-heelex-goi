@@ -1572,7 +1572,8 @@ func rejectNeedsTermAccept(codes []string) bool {
 			cu == "WAITING_PENDING_TERMS" || cu == "ORDER_TOTAL_CHANGED" ||
 			cu == "PAYMENT_AMOUNT_CHANGED" || strings.Contains(cu, "MUST_BE_ACCEPTED") ||
 			strings.Contains(cu, "DETAIL_CHANGED") || strings.Contains(cu, "INCLUSIVITY") ||
-			strings.Contains(cu, "TERMS_CHANGED") || cu == "PAYMENTS_METHOD" {
+			strings.Contains(cu, "TERMS_CHANGED") || cu == "PAYMENTS_METHOD" ||
+			strings.Contains(cu, "FLEXIBILITY") {
 			return true
 		}
 	}
@@ -3005,6 +3006,9 @@ acquireVariant:
 		if tf := fstr(body, "transformerFingerprintV2"); tf != "" {
 			transformerFP = tf
 		}
+		if _fid := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); _fid != "" && _fid != flexID {
+			flexID = _fid
+		}
 	}
 	needRateWait := false
 	rateDelayMs := 1000
@@ -4147,7 +4151,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v28-receipt-source"
+const BUILD_VERSION = "v29-flex-resubmit"
 const RECEIPT_SUPPORT = true
 
 func main() {
