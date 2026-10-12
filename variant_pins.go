@@ -320,4 +320,7 @@ var pinnedVariants = map[string]string{
 	"https://zhunzhe.myshopify.com":                              "45344174342332", // $7.99
 	"https://zomb-blades.myshopify.com":                          "47867714240669", // $19.95
 	"https://zositech.myshopify.com":                             "47388666855666", // $5.99
+	"https://76010d.myshopify.com":                               "51400393654553", // $0.48 (inscan IN)
+	"https://brand-ksecret.myshopify.com":                        "41864955953284", // $14.0 (inscan IN)
+	"https://kalaonlineshaz.myshopify.com":                       "50429706600693", // $300.0 cheapest found (inscan IN)
 }
