@@ -330,4 +330,5 @@ var pinnedVariants = map[string]string{
 	"https://bluemercury-inc.myshopify.com":                      "43202564259915", // $17.0 lowest
 	"https://caffe-luxxe.myshopify.com":                          "41093646778438", // $4.75 lowest
 	"https://gsp2123.myshopify.com":                              "44469181219089", // $1.0 lowest
+	"https://bfac4f-a6.myshopify.com":                            "54099035390236", // $8.0 lowest
 }
