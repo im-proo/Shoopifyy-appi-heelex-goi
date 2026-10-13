@@ -287,8 +287,8 @@ func TestEnsureAddress2(t *testing.T) {
 
 // Pinned-variant lookup: exact hit, case-insensitive fallback, miss.
 func TestPinnedVariant(t *testing.T) {
-	if n := len(pinnedVariants); n != 321 {
-		t.Fatalf("pinnedVariants = %d, want 321", n)
+	if n := len(pinnedVariants); n != 325 {
+		t.Fatalf("pinnedVariants = %d, want 325", n)
 	}
 	if got := pinnedVariant("https://arizonasun.myshopify.com"); got != "44042332176564" {
 		t.Errorf("arizonasun pin = %q", got)

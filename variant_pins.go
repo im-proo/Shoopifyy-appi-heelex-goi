@@ -326,4 +326,8 @@ var pinnedVariants = map[string]string{
 	"https://nanushka-production.myshopify.com":                  "55280174432635", // $60.0 (inscan-retry)
 	"https://oqqfitnes.myshopify.com":                            "50676179632439", // $9.99 (inscan-retry)
 	"https://topper-traders-2.myshopify.com":                     "67599448179009", // $4.0 (inscan-retry)
+	"https://better-you-uk.myshopify.com":                        "48186837500064", // $1.99 lowest
+	"https://bluemercury-inc.myshopify.com":                      "43202564259915", // $17.0 lowest
+	"https://caffe-luxxe.myshopify.com":                          "41093646778438", // $4.75 lowest
+	"https://gsp2123.myshopify.com":                              "44469181219089", // $1.0 lowest
 }
