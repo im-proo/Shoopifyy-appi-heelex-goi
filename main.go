@@ -2176,6 +2176,52 @@ func receiptTransient(url string) bool {
 		strings.Contains(url, "checkout-completion")
 }
 
+// receiptPaid verifies a guest order-status page shows money captured.
+// Only downgrades on positive unpaid evidence (pending/authorized):
+// fetch/parse failures keep the PAID verdict — never lose a real charge
+// to a flaky fetch. Returns true unless the page says otherwise.
+func receiptPaid(pageURL string, client *http.Client) bool {
+	if pageURL == "" || !(strings.Contains(pageURL, "/orders/") ||
+		strings.Contains(pageURL, "order_status") ||
+		strings.Contains(pageURL, "/thank_you")) {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
+	if err != nil {
+		return true
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return true
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return true
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return true
+	}
+	low := bytes.ToLower(body)
+	// Unpaid markers (guest pages embed financial_status JSON).
+	for _, m := range []string{`"financial_status":"pending"`,
+		`"financial_status":"authorized"`, `"financial_status":"partially_paid"`,
+		`"financial_status":"partially-paid"`, `total paid today.0`, `amount paid.0`,
+		`>pending<`, `payment pending`} {
+		if bytes.Contains(low, []byte(m)) {
+			return false
+		}
+	}
+	if bytes.Contains(low, []byte(`"financial_status":"paid"`)) {
+		return true
+	}
+	return true
+}
+
 // sellerCurrencyFrom reads the seller's presentment currency out of any
 // negotiation/submit body via its checkoutTotal. Empty when absent.
 func sellerCurrencyFrom(body []byte) string {
@@ -2210,6 +2256,10 @@ func syncProposalCurrency(variables map[string]interface{}, cur string) {
 func updateMetricsAndDead(msg, baseURL string) {
 	switch msg {
 	case "ORDER_PAID":
+		atomic.AddInt64(&metrics.TotalSuccess, 1)
+	case "ORDER_AUTHORIZED":
+		// Auth-only order (manual-capture store): real bank approval,
+		// no money moved. Counted, never a charge.
 		atomic.AddInt64(&metrics.TotalSuccess, 1)
 	case "RATE_LIMITED":
 		atomic.AddInt64(&metrics.RateLimited, 1)
@@ -2346,8 +2396,9 @@ acquireVariant:
 	}
 	fName, lName := getRandName()
 	email := genEmail(fName, lName)
-	// imsh override: user-supplied Indian identity ships a real parcel.
-	// Both billing + delivery use it (coherent person, one address).
+	// imsh override: user's identity ships a real parcel. Delivery uses
+	// the user's address; BILLING stays random (addrbook) by policy —
+	// never tie the card to a real identity.
 	customIN := custom.valid()
 	if customIN {
 		if nm := strings.TrimSpace(custom.Name); nm != "" {
@@ -2367,7 +2418,6 @@ acquireVariant:
 			PostalCode: custom.Pin, ZoneCode: custom.State,
 			CountryCode: "IN", Phone: "+91" + custom.Phone,
 		}
-		addr = shipAddr
 	}
 	phone := normalizePhone(addr.Phone, addr.CountryCode)
 	// Per-check randomized national number: static Book phones (55555555,
@@ -2638,13 +2688,10 @@ acquireVariant:
 		"zoneCode": shipAddr.ZoneCode, "phone": phoneE164,
 		"company": fName + " " + lName,
 	}
-	// imsh: user's real address2 (flat/landmark) rides on both streets.
+	// imsh: user's real address2 (flat/landmark) rides on delivery only.
+	// Billing stays random by policy.
 	if customIN && strings.TrimSpace(custom.Addr2) != "" {
-		a2 := strings.TrimSpace(custom.Addr2)
-		if sa, ok := billingAddr["streetAddress"].(map[string]string); ok {
-			sa["address2"] = a2
-		}
-		shipStreet["address2"] = a2
+		shipStreet["address2"] = strings.TrimSpace(custom.Addr2)
 	}
 
 	// Delivery terms: SHIPPING for physical goods, noDeliveryRequired for digital.
@@ -3722,6 +3769,15 @@ acquireVariant:
 			_url, _src := receiptURL(body)
 			res.Redirect = _url
 			log.Printf("[DBG receipt] base=%s source=%s transient=%v", baseURL, _src, receiptTransient(_url))
+			// Capture check: manual-capture stores return ProcessedReceipt
+			// for authorize-only orders ("confirmed", paid=0). Verify the
+			// guest page shows money captured; else ORDER_AUTHORIZED —
+			// logged, never counted as a charge.
+			if _src == "orderStatusPageUrl" && !receiptPaid(_url, client) {
+				res.Success = false
+				res.Message = "ORDER_AUTHORIZED"
+				log.Printf("[DBG receipt] base=%s authorized-only (unpaid)", baseURL)
+			}
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
 		} else if receiptType == "ActionRequiredReceipt" {
@@ -3800,6 +3856,15 @@ acquireVariant:
 			_url, _src := receiptURL(body)
 			res.Redirect = _url
 			log.Printf("[DBG receipt] base=%s source=%s transient=%v", baseURL, _src, receiptTransient(_url))
+			// Capture check: manual-capture stores return ProcessedReceipt
+			// for authorize-only orders ("confirmed", paid=0). Verify the
+			// guest page shows money captured; else ORDER_AUTHORIZED —
+			// logged, never counted as a charge.
+			if _src == "orderStatusPageUrl" && !receiptPaid(_url, client) {
+				res.Success = false
+				res.Message = "ORDER_AUTHORIZED"
+				log.Printf("[DBG receipt] base=%s authorized-only (unpaid)", baseURL)
+			}
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
 		} else if pollType == "FailedReceipt" {
@@ -4235,7 +4300,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v30-imsh-addr"
+const BUILD_VERSION = "v31 real-capture"
 const RECEIPT_SUPPORT = true
 
 func main() {
