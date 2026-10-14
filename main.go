@@ -965,6 +965,28 @@ func markDeadStore(baseURL, reason string, ttl time.Duration) {
 	deadStores.Store(baseURL, deadEntry{Reason: reason, Expiry: time.Now().Add(ttl)})
 }
 
+// authOnlyTracks counts per-store authorize-only vs captured orders.
+// A store that authorizes 3+ times without a single capture is a
+// manual-capture ("confirmed, paid=0") store: bench it 24h so the pool
+// converges on real-capture quality automatically.
+var authOnlyTracks sync.Map // baseURL -> [2]int64{authorized, paid}
+
+func trackCapture(baseURL string, captured bool) {
+	if baseURL == "" {
+		return
+	}
+	v, _ := authOnlyTracks.LoadOrStore(baseURL, &[2]int64{})
+	c := v.(*[2]int64)
+	if captured {
+		atomic.AddInt64(&c[1], 1)
+		return
+	}
+	if atomic.AddInt64(&c[0], 1) >= 3 && atomic.LoadInt64(&c[1]) == 0 {
+		markDeadStore(baseURL, "AUTH_ONLY", 24*time.Hour)
+		log.Printf("[DBG authonly] base=%s benched 24h (3+ auth, 0 capture)", baseURL)
+	}
+}
+
 func clearMap(m *sync.Map) {
 	m.Range(func(k, _ interface{}) bool {
 		m.Delete(k)
@@ -2257,10 +2279,12 @@ func updateMetricsAndDead(msg, baseURL string) {
 	switch msg {
 	case "ORDER_PAID":
 		atomic.AddInt64(&metrics.TotalSuccess, 1)
+		trackCapture(baseURL, true)
 	case "ORDER_AUTHORIZED":
 		// Auth-only order (manual-capture store): real bank approval,
 		// no money moved. Counted, never a charge.
 		atomic.AddInt64(&metrics.TotalSuccess, 1)
+		trackCapture(baseURL, false)
 	case "RATE_LIMITED":
 		atomic.AddInt64(&metrics.RateLimited, 1)
 		atomic.AddInt64(&metrics.TotalFailed, 1)
