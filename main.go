@@ -3794,13 +3794,19 @@ acquireVariant:
 			res.Redirect = _url
 			log.Printf("[DBG receipt] base=%s source=%s transient=%v", baseURL, _src, receiptTransient(_url))
 			// Capture check: manual-capture stores return ProcessedReceipt
-			// for authorize-only orders ("confirmed", paid=0). Verify the
-			// guest page shows money captured; else ORDER_AUTHORIZED —
-			// logged, never counted as a charge.
+			// for authorize-only orders ("confirmed", paid=0). Only a
+			// durable, verified-paid guest page counts as a charge.
+			// Transient session handoffs (die in minutes, never provable)
+			// and unverifiable links log as AUTHORIZED — live card,
+			// never counted as a charge.
 			if _src == "orderStatusPageUrl" && !receiptPaid(_url, client) {
 				res.Success = false
 				res.Message = "ORDER_AUTHORIZED"
 				log.Printf("[DBG receipt] base=%s authorized-only (unpaid)", baseURL)
+			} else if _src != "orderStatusPageUrl" {
+				res.Success = false
+				res.Message = "ORDER_AUTHORIZED"
+				log.Printf("[DBG receipt] base=%s no durable proof (source=%s transient=%v)", baseURL, _src, receiptTransient(_url))
 			}
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
@@ -3881,13 +3887,19 @@ acquireVariant:
 			res.Redirect = _url
 			log.Printf("[DBG receipt] base=%s source=%s transient=%v", baseURL, _src, receiptTransient(_url))
 			// Capture check: manual-capture stores return ProcessedReceipt
-			// for authorize-only orders ("confirmed", paid=0). Verify the
-			// guest page shows money captured; else ORDER_AUTHORIZED —
-			// logged, never counted as a charge.
+			// for authorize-only orders ("confirmed", paid=0). Only a
+			// durable, verified-paid guest page counts as a charge.
+			// Transient session handoffs (die in minutes, never provable)
+			// and unverifiable links log as AUTHORIZED — live card,
+			// never counted as a charge.
 			if _src == "orderStatusPageUrl" && !receiptPaid(_url, client) {
 				res.Success = false
 				res.Message = "ORDER_AUTHORIZED"
 				log.Printf("[DBG receipt] base=%s authorized-only (unpaid)", baseURL)
+			} else if _src != "orderStatusPageUrl" {
+				res.Success = false
+				res.Message = "ORDER_AUTHORIZED"
+				log.Printf("[DBG receipt] base=%s no durable proof (source=%s transient=%v)", baseURL, _src, receiptTransient(_url))
 			}
 			res.Time = fmt.Sprintf("%.2fs", time.Since(cardStart).Seconds())
 			return res
@@ -4324,7 +4336,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v31 real-capture"
+const BUILD_VERSION = "v31.1 transient-proof"
 const RECEIPT_SUPPORT = true
 
 func main() {
