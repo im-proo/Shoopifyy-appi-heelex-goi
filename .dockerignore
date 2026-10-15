@@ -1,0 +1,10 @@
+.git
+.github
+*.log
+shopapi
+*.tmp
+*.swp
+mongo_sites_backup_298.json
+pool_audit_report.json
+proxies.txt
+sites_1599.txt
