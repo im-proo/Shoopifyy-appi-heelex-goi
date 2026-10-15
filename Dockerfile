@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for Shopify Checkout Engine (Optimized for Render / Docker)
 # Stage 1: Build binary
-FROM golang:alpine AS builder
+FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: shopify-api-v33
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: GOGC
+        value: 20

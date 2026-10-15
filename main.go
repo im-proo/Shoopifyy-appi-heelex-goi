@@ -1700,42 +1700,48 @@ func rejectNeedsTermAccept(codes []string) bool {
 // AUTO VARIANT FETCHER
 // ==========================================
 
-const VARIANT_FETCH_QUERY = `query{products(first:50){edges{node{variants(first:50){edges{node{id availableForSale requiresShipping price{amount currencyCode}}}}}}}}`
+const VARIANT_FETCH_QUERY = `query{products(first:50,sortKey:PRICE){edges{node{variants(first:20){edges{node{id availableForSale requiresShipping price{amount currencyCode}}}}}}}}`
+const VARIANT_FETCH_QUERY_FALLBACK = `query{products(first:50){edges{node{variants(first:50){edges{node{id availableForSale requiresShipping price{amount currencyCode}}}}}}}}`
 
-// fetchREST pulls variants from /products.json (no token needed). Runs
-// BEFORE the GraphQL path: token scraping fails on JS-heavy catalogs while
-// products.json usually answers.
-func fetchREST(ctx context.Context, client *http.Client, baseURL string) []byte {
-	rctx, cancel := context.WithTimeout(ctx, 12*time.Second)
-	defer cancel()
-	for _, p := range []string{"/products.json?limit=250", "/products.json?limit=100", "/collections/all/products.json?limit=50"} {
-		req, err := http.NewRequestWithContext(rctx, "GET", baseURL+p, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
-		req.Header.Set("Accept", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode == 200 && len(body) > 100 && bytes.Contains(body, []byte(`"variants"`)) {
-			return body
-		}
+func parsePrice(val interface{}) (float64, error) {
+	switch v := val.(type) {
+	case float64:
+		return v, nil
+	case int64:
+		return float64(v), nil
+	case int:
+		return float64(v), nil
+	case string:
+		return strconv.ParseFloat(strings.ReplaceAll(strings.TrimSpace(v), ",", ""), 64)
+	default:
+		return 0, fmt.Errorf("unknown price type")
 	}
-	return nil
 }
 
+func parseVariantID(val interface{}) string {
+	switch v := val.(type) {
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case int:
+		return strconv.Itoa(v)
+	case string:
+		return strings.TrimSpace(v)
+	default:
+		return ""
+	}
+}
+
+// pickREST parses products JSON and selects the cheapest in-stock paid variant (0.01 <= price <= 20.00).
 func pickREST(data []byte) (string, float64, bool, bool) {
 	var r struct {
 		Products []struct {
 			Variants []struct {
-				ID              int64  `json:"id"`
-				Available       *bool  `json:"available"`
-				RequiresShipping *bool `json:"requires_shipping"`
-				Price           string `json:"price"`
+				ID               interface{} `json:"id"`
+				Available        *bool       `json:"available"`
+				RequiresShipping *bool       `json:"requires_shipping"`
+				Price            interface{} `json:"price"`
 			} `json:"variants"`
 		} `json:"products"`
 	}
@@ -1745,7 +1751,6 @@ func pickREST(data []byte) (string, float64, bool, bool) {
 	type candidate struct {
 		id       string
 		price    float64
-		band     int
 		shipping bool
 	}
 	var pool []candidate
@@ -1754,10 +1759,11 @@ func pickREST(data []byte) (string, float64, bool, bool) {
 			if v.Available != nil && !*v.Available {
 				continue
 			}
-			if v.ID == 0 {
+			idStr := parseVariantID(v.ID)
+			if idStr == "" || idStr == "0" {
 				continue
 			}
-			price, err := strconv.ParseFloat(strings.ReplaceAll(v.Price, ",", ""), 64)
+			price, err := parsePrice(v.Price)
 			if err != nil || price < 0.01 || price > 20.0 {
 				continue
 			}
@@ -1765,7 +1771,7 @@ func pickREST(data []byte) (string, float64, bool, bool) {
 			if v.RequiresShipping != nil {
 				ship = *v.RequiresShipping
 			}
-			pool = append(pool, candidate{id: strconv.FormatInt(v.ID, 10), price: price, shipping: ship})
+			pool = append(pool, candidate{id: idStr, price: price, shipping: ship})
 		}
 	}
 	if len(pool) == 0 {
@@ -1782,14 +1788,69 @@ func pickREST(data []byte) (string, float64, bool, bool) {
 	return best.id, best.price, best.shipping, true
 }
 
+// fetchStoreCurrency fetches currency from /cart.js (fallback for REST path)
+func fetchStoreCurrency(ctx context.Context, client *http.Client, baseURL string) string {
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, "GET", baseURL+"/cart.js", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var cart struct {
+		Currency string `json:"currency"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&cart) == nil && cart.Currency != "" {
+		return strings.ToUpper(strings.TrimSpace(cart.Currency))
+	}
+	return ""
+}
+
+// fetchREST attempts multiple product endpoints in order of cheapest sort first,
+// returning the cheapest available valid variant immediately.
+func fetchREST(ctx context.Context, client *http.Client, baseURL string) (string, float64, bool, bool) {
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for _, p := range []string{
+		"/collections/all/products.json?sort_by=price-ascending&limit=50",
+		"/products.json?sort_by=price-ascending&limit=50",
+		"/products.json?limit=250",
+		"/collections/all/products.json?limit=250",
+		"/products.json?limit=50",
+	} {
+		req, err := http.NewRequestWithContext(rctx, "GET", baseURL+p, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == 200 && len(body) > 50 && bytes.Contains(body, []byte(`"variants"`)) {
+			if id, price, shipping, ok := pickREST(body); ok {
+				return id, price, shipping, true
+			}
+		}
+	}
+	return "", 0, false, false
+}
+
 func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
-	// Bound the whole variant hunt: sequential version attempts + homepage scrape
-	// must never burn the 90s request budget (was hitting 90.00s wall).
 	var cancel context.CancelFunc
 	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	reVid := regexp.MustCompile(`ProductVariant/(\d+)`)
-	tokenRe := regexp.MustCompile(`(?i)(?:storefrontAccessToken|accessToken)["']?\s*[:=]\s*["']([a-f0-9]{32})`)
+	tokenRe := regexp.MustCompile(`(?i)(?:storefront_?access_?token|accessToken|access_token|storefront_?api_?key)["']?\s*[:=]\s*["']([a-f0-9]{32})`)
 
 	type gqlVariant struct {
 		ID               string `json:"id"`
@@ -1817,33 +1878,32 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 	}
 
 	fetch := func(token string) []byte {
-		for _, ver := range []string{"2026-10", "2026-07", "2026-04", "2026-01", "2025-10", "2025-07", "2025-04", "2025-01"} {
-			gqlURL := fmt.Sprintf("%s/api/%s/graphql.json", baseURL, ver)
-			payload, _ := json.Marshal(map[string]interface{}{"query": VARIANT_FETCH_QUERY})
-			req, err := http.NewRequestWithContext(ctx, "POST", gqlURL, bytes.NewReader(payload))
-			if err != nil {
-				continue
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
-			if token != "" {
-				req.Header.Set("X-Shopify-Storefront-Access-Token", token)
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				continue
-			}
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode != 200 {
-				if resp.StatusCode != 404 {
-					return body
+		queries := []string{VARIANT_FETCH_QUERY, VARIANT_FETCH_QUERY_FALLBACK}
+		for _, q := range queries {
+			payload, _ := json.Marshal(map[string]interface{}{"query": q})
+			for _, ver := range []string{"2026-10", "2026-07", "2026-04", "2026-01", "2025-10", "2025-07", "2025-04", "2025-01", "2024-10", "2024-07", "2024-04", "2024-01", "unstable"} {
+				gqlURL := fmt.Sprintf("%s/api/%s/graphql.json", baseURL, ver)
+				req, err := http.NewRequestWithContext(ctx, "POST", gqlURL, bytes.NewReader(payload))
+				if err != nil {
+					continue
 				}
-				continue
-			}
-			var probe gqlResp
-			if json.Unmarshal(body, &probe) == nil && probe.Data != nil && probe.Data.Products != nil {
-				return body
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+				if token != "" {
+					req.Header.Set("X-Shopify-Storefront-Access-Token", token)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					var probe gqlResp
+					if json.Unmarshal(body, &probe) == nil && probe.Data != nil && probe.Data.Products != nil && len(probe.Data.Products.Edges) > 0 {
+						return body
+					}
+				}
 			}
 		}
 		return nil
@@ -1858,7 +1918,6 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 			id       string
 			price    float64
 			currency string
-			band     int
 			shipping bool
 		}
 		var candidates []candidate
@@ -1896,27 +1955,25 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 		return best.id, best.price, best.currency, best.shipping, true
 	}
 
-	// REST-first: /products.json needs no storefront token and works on
-	// stores where token scraping fails (JS catalogs, odd themes). Currency
-	// is absent from this endpoint — caller keeps its default.
-	if body := fetchREST(ctx, client, baseURL); body != nil {
-		if id, price, shipping, ok := pickREST(body); ok {
-			return id, price, "", shipping, nil
-		}
+	// 1. REST-first: works without storefront access tokens and catches collections
+	if id, price, shipping, ok := fetchREST(ctx, client, baseURL); ok {
+		cur := fetchStoreCurrency(ctx, client, baseURL)
+		return id, price, cur, shipping, nil
 	}
 
+	// 2. Anonymous GraphQL (Storefront API)
 	if body := fetch(""); body != nil {
 		if id, price, cur, shipping, ok := pick(body); ok {
 			return id, price, cur, shipping, nil
 		}
 	}
 
-	// Fallback: extract storefront token from homepage (via token cache) and retry
+	// 3. Fallback: extract storefront token from homepage (via token cache) and retry GraphQL
 	homeToken := ""
 	if cached, ok := cacheLookupToken(baseURL); ok {
 		homeToken = cached
 	} else if req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil); err == nil {
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 		if resp, err := client.Do(req); err == nil {
 			if b, err := io.ReadAll(resp.Body); err == nil {
 				if m := tokenRe.FindSubmatch(b); len(m) == 2 {
@@ -1935,20 +1992,9 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 		}
 	}
 
-	return "", 0, "", false, fmt.Errorf("no valid paid variant found")
+	return "", 0, "", false, fmt.Errorf("no valid paid variant found <= $20")
 }
 
-// pinnedVariant returns the audited cheapest variant for a pool store,
-// or "" when unmapped (auto-fetch path, unchanged).
-func pinnedVariant(baseURL string) string {
-	if pid, ok := pinnedVariants[baseURL]; ok {
-		return pid
-	}
-	if pid, ok := pinnedVariants[strings.ToLower(baseURL)]; ok {
-		return pid
-	}
-	return ""
-}
 
 // fetchVariantCached wraps fetchVariant with a 10-minute per-store cache.
 // This is the biggest performance win: 1000 cards on the same store = 1 fetch.
@@ -2442,7 +2488,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 
 	// Sanitize caller-supplied variantID: only pure numeric ASCII digits are valid.
 	// If caller passes garbage, proxy strings, URLs, or non-numeric tokens, reset to ""
-	// so the engine cleanly falls back to pinned variants or auto-fetch instead of 404ing.
+	// so the engine cleanly falls back to auto-fetch instead of 404ing.
 	variantID = strings.TrimSpace(variantID)
 	for _, c := range variantID {
 		if c < '0' || c > '9' {
@@ -2456,20 +2502,6 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	// Default to true so externally supplied variant IDs assume physical goods
 	// (preserves legacy behavior when requiresShipping is unknown).
 	requiresShipping := true
-	pinTried := false
-	fromPin := false
-acquireVariant:
-	if variantID == "" && !pinTried {
-		// Hardcoded audit pins first: reproduce the mapped cheapest variant
-		// with no fetch round-trip. A stale pin (sold out / unpublished)
-		// falls back to auto-fetch at the cart-failure exits below.
-		pinTried = true
-		if pid := pinnedVariant(baseURL); pid != "" {
-			variantID = pid
-			fromPin = true
-			log.Printf("[PIN] using pinned variant %s for %s", pid, baseURL)
-		}
-	}
 	if variantID == "" {
 		vid, price, cur, shipping, err := fetchVariantCached(ctx, client, baseURL)
 		if err != nil {
@@ -2650,14 +2682,6 @@ acquireVariant:
 		}
 		log.Printf("[DBG cart] base=%s status=%d err=%q hasProxy=%v", baseURL, status, _cartErr, proxyStr != "")
 		atomic.AddInt64(&metrics.CartCreateFails, 1)
-		if fromPin {
-			// Pinned variant went stale: drop it for this check and
-			// fall back to auto-fetch (second pass skips the pin).
-			log.Printf("[PIN] stale pin %s for %s, falling back to auto-fetch", variantID, baseURL)
-			fromPin = false
-			variantID = ""
-			goto acquireVariant
-		}
 		if proxyStr != "" {
 			res.Proxy = "Dead"
 		}
@@ -2746,14 +2770,6 @@ acquireVariant:
 			return res
 		}
 		res.Message = "CHECKOUT_SESSION_FAILED"
-		if fromPin {
-			// Same stale-pin fallback as the cart-permalink exit: the pin
-			// yielded no session, retry once via auto-fetch.
-			log.Printf("[PIN] stale pin %s for %s, falling back to auto-fetch", variantID, baseURL)
-			fromPin = false
-			variantID = ""
-			goto acquireVariant
-		}
 		return res
 	}
 
@@ -4334,7 +4350,7 @@ func validateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, status, err := doReq(ctx, client, "GET", baseURL+"/products.json?limit=1", map[string]string{
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 		"Accept":     "application/json",
 	}, nil)
 	if err != nil {
@@ -4477,7 +4493,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v32.0 zero-error engine"
+const BUILD_VERSION = "v33.0 cheapest-variant engine"
 const RECEIPT_SUPPORT = true
 
 func main() {

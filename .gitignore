@@ -13,4 +13,5 @@ pool_valid_sites.txt
 sites_1599.txt
 proxies.txt
 pool_audit_report.json
+pool_check_report.json
 mongo_sites_backup_298.json

@@ -285,21 +285,6 @@ func TestEnsureAddress2(t *testing.T) {
 	ensureAddress2(map[string]interface{}{"streetAddress": 1}, ss)
 }
 
-// Pinned-variant lookup: exact hit, case-insensitive fallback, miss.
-func TestPinnedVariant(t *testing.T) {
-	if n := len(pinnedVariants); n != 326 {
-		t.Fatalf("pinnedVariants = %d, want 326", n)
-	}
-	if got := pinnedVariant("https://arizonasun.myshopify.com"); got != "44042332176564" {
-		t.Errorf("arizonasun pin = %q", got)
-	}
-	if got := pinnedVariant("https://ARIZONASUN.myshopify.com"); got != "44042332176564" {
-		t.Errorf("case-insensitive pin = %q", got)
-	}
-	if got := pinnedVariant("https://no-such-store.example.com"); got != "" {
-		t.Errorf("unknown store pin = %q, want empty", got)
-	}
-}
 
 // sellerCurrencyFrom reads checkoutTotal.currencyCode from proposal or
 // submit-rejection bodies; empty when the seller published none.
@@ -521,6 +506,29 @@ func TestLowestAmountVariantPicker(t *testing.T) {
 	id, price, ship, ok = pickREST(dataFree)
 	if !ok || id != "402" || price != 0.50 || !ship {
 		t.Errorf("expected variant 402 ($0.50, skipping $0.00 free item), got id=%s price=%f ship=%v", id, price, ship)
+	}
+
+	// Case 5: Out of stock (available: false) items must be skipped
+	dataOOS := []byte(`{
+		"products": [
+			{"variants": [{"id": 501, "price": "0.10", "available": false, "requires_shipping": true}]},
+			{"variants": [{"id": 502, "price": "1.99", "available": true, "requires_shipping": true}]}
+		]
+	}`)
+	id, price, ship, ok = pickREST(dataOOS)
+	if !ok || id != "502" || price != 1.99 || !ship {
+		t.Errorf("expected variant 502 ($1.99, skipping $0.10 out-of-stock item), got id=%s price=%f ship=%v", id, price, ship)
+	}
+
+	// Case 6: Numeric float price and string ID in JSON
+	dataNumeric := []byte(`{
+		"products": [
+			{"variants": [{"id": "601", "price": 0.99, "available": true, "requires_shipping": true}]}
+		]
+	}`)
+	id, price, ship, ok = pickREST(dataNumeric)
+	if !ok || id != "601" || price != 0.99 || !ship {
+		t.Errorf("expected variant 601 ($0.99 with numeric float price), got id=%s price=%f ship=%v", id, price, ship)
 	}
 }
 
