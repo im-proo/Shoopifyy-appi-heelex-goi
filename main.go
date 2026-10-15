@@ -1689,7 +1689,9 @@ func rejectNeedsTermAccept(codes []string) bool {
 			cu == "PAYMENT_AMOUNT_CHANGED" || strings.Contains(cu, "MUST_BE_ACCEPTED") ||
 			strings.Contains(cu, "DETAIL_CHANGED") || strings.Contains(cu, "INCLUSIVITY") ||
 			strings.Contains(cu, "TERMS_CHANGED") || cu == "PAYMENTS_METHOD" ||
-			strings.Contains(cu, "FLEXIBILITY") {
+			strings.Contains(cu, "FLEXIBILITY") || strings.Contains(cu, "ARTIFACT") ||
+			strings.Contains(cu, "PRESENTMENT_CURRENCY") || strings.Contains(cu, "STRATEGY_CONDITIONS") ||
+			strings.Contains(cu, "REQUIRED_ARTIFACTS") {
 			return true
 		}
 	}
@@ -2025,7 +2027,7 @@ func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string
 
 const QUERY_PROPOSAL = `query Proposal($sessionInput:SessionTokenInput!,$queueToken:String,$checkpointData:String,$delivery:DeliveryTermsInput,$merchandise:MerchandiseTermInput,$payment:PaymentTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{delivery:$delivery,discounts:{lines:[],acceptUnexpectedDiscounts:true},payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,tip:$tip,note:$note,localizationExtension:$localizationExtension,nonNegotiableTerms:$nonNegotiableTerms,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties},checkpointData:$checkpointData,queueToken:$queueToken}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails __typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}fragment BuyerProposalDetails on Proposal{buyerIdentity{...on FilledBuyerIdentityTerms{email phone customer{...on CustomerProfile{email __typename}...on BusinessCustomerProfile{email __typename}__typename}__typename}__typename}merchandiseDiscount{...ProposalDiscountFragment __typename}deliveryDiscount{...ProposalDiscountFragment __typename}delivery{...ProposalDeliveryFragment __typename}merchandise{...on FilledMerchandiseTerms{taxesIncluded merchandiseLines{stableId merchandise{...SourceProvidedMerchandise...ProductVariantMerchandiseDetails...ContextualizedProductVariantMerchandiseDetails...on MissingProductVariantMerchandise{id digest variantId __typename}__typename}quantity{...on ProposalMerchandiseQuantityByItem{items{...on IntValueConstraint{value __typename}__typename}__typename}__typename}totalAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}recurringTotal{title interval intervalCount recurringPrice{amount currencyCode __typename}fixedPrice{amount currencyCode __typename}fixedPriceCount __typename}lineAllocations{...LineAllocationDetails __typename}lineComponentsSource lineComponents{...MerchandiseBundleLineComponent __typename}components{...MerchandiseLineComponentWithCapabilities __typename}legacyFee __typename}__typename}__typename}runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotalTaxes{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}fragment ProposalDetails on Proposal{runningTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}subtotalBeforeTaxesAndShipping{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}deliveryExpectations{...on FilledDeliveryExpectationTerms{deliveryExpectations{deliveryStrategyHandle signedHandle __typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}scriptFingerprint{signature signatureUuid __typename}transformerFingerprintV2 delivery{...on FilledDeliveryTerms{deliveryLines{targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{handle amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}intermediateRates progressiveRatesEstimatedTimeUntilCompletion __typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}payment{...on FilledPaymentTerms{availablePaymentLines{paymentMethod{...on PaymentProvider{paymentMethodIdentifier name extensibilityDisplayName __typename}...on OffsiteProvider{paymentMethodIdentifier name __typename}...on CustomOnsiteProvider{paymentMethodIdentifier name __typename}...on CustomerCreditCardPaymentMethod{paymentMethodIdentifier __typename}...on PaypalBillingAgreementPaymentMethod{paymentMethodIdentifier __typename}__typename}__typename}paymentFlexibilityPaymentTermsTemplate{id translatedName dueDate dueInDays type __typename}depositConfiguration{...on DepositPercentage{percentage __typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}...on UnavailableTerms{__typename}__typename}__typename}fragment ProposalDiscountFragment on DiscountTermsV2{__typename...on FilledDiscountTerms{acceptUnexpectedDiscounts lines{...DiscountLineDetailsFragment __typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment DiscountLineDetailsFragment on DiscountLine{allocations{...on DiscountAllocatedAllocationSet{__typename allocations{amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}target{index targetType stableId __typename}__typename}}__typename}discount{...DiscountDetailsFragment __typename}lineAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}fragment DiscountDetailsFragment on Discount{...on CustomDiscount{title description presentationLevel allocationMethod targetSelection targetType signature signatureUuid type value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on CodeDiscount{title code presentationLevel allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on DiscountCodeTrigger{code __typename}...on AutomaticDiscount{presentationLevel title allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}fragment ProposalDeliveryFragment on DeliveryTerms{__typename...on FilledDeliveryTerms{deliveryLines{destinationAddress{...on StreetAddress{handle __typename}...on Geolocation{__typename}...on PartialStreetAddress{__typename}__typename}targetMerchandise{...FilledMerchandiseLineTargetCollectionFragment __typename}groupType selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{title handle __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay taskId __typename}...on UnavailableTerms{__typename}}fragment FilledMerchandiseLineTargetCollectionFragment on FilledMerchandiseLineTargetCollection{linesV2{...on MerchandiseLine{stableId merchandise{...DeliveryLineMerchandiseFragment __typename}__typename}...on MerchandiseBundleLineComponent{stableId merchandise{...DeliveryLineMerchandiseFragment __typename}__typename}...on MerchandiseLineComponentWithCapabilities{stableId merchandise{...DeliveryLineMerchandiseFragment __typename}__typename}__typename}__typename}fragment DeliveryLineMerchandiseFragment on ProposalMerchandise{...on SourceProvidedMerchandise{__typename requiresShipping}...on ProductVariantMerchandise{__typename requiresShipping}...on ContextualizedProductVariantMerchandise{__typename requiresShipping}...on MissingProductVariantMerchandise{__typename variantId}__typename}fragment SourceProvidedMerchandise on Merchandise{...on SourceProvidedMerchandise{__typename product{id title __typename}variantId title price{amount currencyCode __typename}}__typename}fragment ProductVariantMerchandiseDetails on ProductVariantMerchandise{id variantId title product{id __typename}requiresShipping __typename}fragment ContextualizedProductVariantMerchandiseDetails on ContextualizedProductVariantMerchandise{id variantId title sku price{amount currencyCode __typename}product{id __typename}requiresShipping __typename}fragment LineAllocationDetails on LineAllocation{stableId __typename}fragment MerchandiseBundleLineComponent on MerchandiseBundleLineComponent{__typename stableId __typename}fragment MerchandiseLineComponentWithCapabilities on MerchandiseLineComponentWithCapabilities{__typename stableId __typename}`
 
-const MUTATION_SUBMIT = `mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken analytics:$analytics){...on SubmitSuccess{receipt{...ReceiptDetails __typename}__typename}...on SubmitAlreadyAccepted{receipt{...ReceiptDetails __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}__typename}deliveryExpectations{...on FilledDeliveryExpectationTerms{deliveryExpectations{deliveryStrategyHandle signedHandle __typename}__typename}...on PendingTerms{pollDelay __typename}__typename}delivery{...on FilledDeliveryTerms{deliveryLines{selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}...on SubmittedForCompletion{receipt{...ReceiptDetails __typename}__typename}__typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl orderStatusPageUrl confirmationPage{url shouldRedirect __typename} postPurchasePageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{__typename}__typename}__typename}__typename}fragment BuyerProposalDetails on Proposal{__typename}fragment ProposalDetails on Proposal{__typename}`
+const MUTATION_SUBMIT = `mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken analytics:$analytics){...on SubmitSuccess{receipt{...ReceiptDetails __typename}__typename}...on SubmitAlreadyAccepted{receipt{...ReceiptDetails __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{buyerProposal{...BuyerProposalDetails __typename}sellerProposal{...ProposalDetails tax{...on FilledTaxTerms{totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}__typename}deliveryExpectations{...on FilledDeliveryExpectationTerms{deliveryExpectations{deliveryStrategyHandle signedHandle __typename}__typename}...on PendingTerms{pollDelay __typename}__typename}delivery{...on FilledDeliveryTerms{deliveryLines{selectedDeliveryStrategy{...on CompleteDeliveryStrategy{handle __typename}...on DeliveryStrategyReference{handle __typename}__typename}availableDeliveryStrategies{...on CompleteDeliveryStrategy{handle amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on PendingTerms{pollDelay __typename}__typename}scriptFingerprint{signature signatureUuid __typename}transformerFingerprintV2 __typename}errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}...on SubmittedForCompletion{receipt{...ReceiptDetails __typename}__typename}__typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl orderStatusPageUrl confirmationPage{url shouldRedirect __typename} postPurchasePageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{__typename}__typename}__typename}__typename}fragment BuyerProposalDetails on Proposal{__typename}fragment ProposalDetails on Proposal{__typename}`
 
 const QUERY_POLL = `query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){...ReceiptDetails __typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl orderStatusPageUrl confirmationPage{url shouldRedirect __typename} postPurchasePageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}__typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{__typename}__typename}__typename}__typename}`
 
@@ -2073,7 +2075,9 @@ func extractSignedHandle(body []byte) string {
 // mismatch): only a fresh proposal gives current terms. Anything else
 // keeps the existing remedy path.
 func needsReproposal(code string) bool {
-	return strings.Contains(code, "FLEXIBILITY") || code == "PAYMENTS_METHOD"
+	return strings.Contains(code, "FLEXIBILITY") || code == "PAYMENTS_METHOD" ||
+		strings.Contains(code, "ARTIFACT") || strings.Contains(code, "REQUIRED_ARTIFACTS") ||
+		strings.Contains(code, "INVALID_PAYMENT_METHOD")
 }
 
 // extractPaymentID returns the seller's current paymentMethodIdentifier +
@@ -2376,11 +2380,15 @@ func syncProposalCurrency(variables map[string]interface{}, cur string) {
 	if _bi, ok := variables["buyerIdentity"].(map[string]interface{}); ok {
 		if _cu, ok := _bi["customer"].(map[string]string); ok {
 			_cu["presentmentCurrency"] = cur
+		} else if _cu, ok := _bi["customer"].(map[string]interface{}); ok {
+			_cu["presentmentCurrency"] = cur
 		}
 	}
 	if _tx, ok := variables["taxes"].(map[string]interface{}); ok {
 		if _pta, ok := _tx["proposedTotalAmount"].(map[string]interface{}); ok {
 			if _v, ok := _pta["value"].(map[string]string); ok {
+				_v["currencyCode"] = cur
+			} else if _v, ok := _pta["value"].(map[string]interface{}); ok {
 				_v["currencyCode"] = cur
 			}
 		}
@@ -3443,13 +3451,33 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				"destination": map[string]interface{}{
 					"streetAddress": shipStreet,
 				},
-				"selectedDeliveryStrategy": map[string]interface{}{
-					"deliveryStrategyByHandle": map[string]interface{}{
-						"handle":             deliveryStrategy,
-						"customDeliveryRate": false,
-					},
-					"options": map[string]string{"phone": phoneE164},
-				},
+				"selectedDeliveryStrategy": func() map[string]interface{} {
+					if deliveryStrategy != "" {
+						return map[string]interface{}{
+							"deliveryStrategyByHandle": map[string]interface{}{
+								"handle":             deliveryStrategy,
+								"customDeliveryRate": false,
+							},
+							"options": map[string]string{"phone": phoneE164},
+						}
+					}
+					if signedHandle != "" {
+						return map[string]interface{}{
+							"deliveryStrategyByHandle": map[string]interface{}{
+								"handle":             signedHandle,
+								"customDeliveryRate": false,
+							},
+							"options": map[string]string{"phone": phoneE164},
+						}
+					}
+					return map[string]interface{}{
+						"deliveryStrategyMatchingConditions": map[string]interface{}{
+							"estimatedTimeInTransit": map[string]interface{}{"any": true},
+							"shipments":              map[string]interface{}{"any": true},
+						},
+						"options": map[string]string{"phone": phoneE164},
+					}
+				}(),
 				"targetMerchandiseLines": map[string]interface{}{
 					"lines": []map[string]string{{"stableId": stableID}},
 				},
@@ -3569,6 +3597,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	_sigHist := []string{}
 	for _rejTry, _topErr := 0, ""; _rejTry < 8 && submitType == "SubmitRejected"; _rejTry++ {
 		errCodes := extractErrorCodes(body)
+		sellerRej := fastExtract(body, "sellerProposal")
+		if sellerRej == nil {
+			sellerRej = body
+		}
 		// Stuck detection: same non-waiting codes 3x in a row, or only 2
 		// distinct codes across the last 4 rounds (A,B,A,B flap) → terminal.
 		// WAITING is exempt (its remedy is elapsed time); cap 8 bounds all.
@@ -3667,6 +3699,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				if _stratIdx < len(_stratHandles) {
 					deliveryStrategy = _stratHandles[_stratIdx]
 					_stratIdx++
+				} else {
+					if dsh := fstr(fastExtract(fastExtract(sellerRej, "deliveryExpectations"), "deliveryExpectations"), "deliveryStrategyHandle"); dsh != "" && dsh != deliveryStrategy {
+						deliveryStrategy = dsh
+					} else if sh := fstr(fastExtract(fastExtract(sellerRej, "deliveryExpectations"), "deliveryExpectations"), "signedHandle"); sh != "" && sh != deliveryStrategy {
+						deliveryStrategy = sh
+					} else {
+						deliveryStrategy = ""
+					}
 				}
 				break
 			}
@@ -3722,6 +3762,8 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				if _bi, ok := submitVars["input"].(map[string]interface{})["buyerIdentity"].(map[string]interface{}); ok {
 					if _cu, ok := _bi["customer"].(map[string]string); ok {
 						_cu["presentmentCurrency"] = _sc
+					} else if _cu, ok := _bi["customer"].(map[string]interface{}); ok {
+						_cu["presentmentCurrency"] = _sc
 					}
 				}
 				syncProposalCurrency(variables, _sc)
@@ -3763,10 +3805,6 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 		}
 		if rejectNeedsTermAccept(errCodes) {
-			sellerRej := fastExtract(body, "sellerProposal")
-			if sellerRej == nil {
-				sellerRej = body
-			}
 			if ta, tc, ok := extractSellerTax(sellerRej); ok {
 				taxAmount = ta
 				_taxFresh = true
@@ -3812,6 +3850,23 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 					lines[0]["selectedDeliveryStrategy"] = map[string]interface{}{
 						"deliveryStrategyByHandle": map[string]interface{}{"handle": deliveryStrategy, "customDeliveryRate": false},
 						"options":                  map[string]string{"phone": _optPhone},
+					}
+				} else {
+					_optPhone := phoneE164
+					switch _phoneMode {
+					case "omit":
+						_optPhone = ""
+					case "local":
+						_optPhone = phoneLocal
+					case "raw":
+						_optPhone = phoneRaw
+					}
+					lines[0]["selectedDeliveryStrategy"] = map[string]interface{}{
+						"deliveryStrategyMatchingConditions": map[string]interface{}{
+							"estimatedTimeInTransit": map[string]interface{}{"any": true},
+							"shipments":              map[string]interface{}{"any": true},
+						},
+						"options": map[string]string{"phone": _optPhone},
 					}
 				}
 				lines[0]["expectedTotalPrice"] = map[string]interface{}{"any": true}
