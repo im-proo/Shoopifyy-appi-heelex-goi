@@ -11,9 +11,8 @@ RUN apk add --no-cache ca-certificates git
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code and site pool
+# Copy source code
 COPY *.go ./
-COPY pool_valid_sites.txt ./
 
 # Compile statically linked binary with stripped debug symbols
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o shopapi .
@@ -26,9 +25,8 @@ WORKDIR /app
 # CA certificates for TLS requests to Shopify & payment endpoints
 RUN apk add --no-cache ca-certificates tzdata
 
-# Copy compiled executable and pool data
+# Copy compiled executable
 COPY --from=builder /app/shopapi /app/shopapi
-COPY --from=builder /app/pool_valid_sites.txt /app/pool_valid_sites.txt
 
 # Render injects PORT dynamically (default 10000)
 ENV PORT=10000
