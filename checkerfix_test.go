@@ -415,3 +415,112 @@ func TestCustomShipValid(t *testing.T) {
 		t.Error("empty profile accepted")
 	}
 }
+
+func TestExtractErrorCodes(t *testing.T) {
+	body := []byte(`{
+		"errors": [
+			{"code": "TAX_NEW_TAX_MUST_BE_ACCEPTED"},
+			{"__typename": "RemoveTermViolation", "message": {"code": "DELIVERY_NO_DELIVERY_STRATEGY_AVAILABLE"}},
+			{"__typename": "AcceptNewTermViolation", "message": {"code": "PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH"}}
+		]
+	}`)
+	codes := extractErrorCodes(body)
+	if len(codes) != 3 {
+		t.Fatalf("expected 3 codes, got %d: %v", len(codes), codes)
+	}
+	if codes[0] != "TAX_NEW_TAX_MUST_BE_ACCEPTED" || codes[1] != "DELIVERY_NO_DELIVERY_STRATEGY_AVAILABLE" || codes[2] != "PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH" {
+		t.Errorf("unexpected codes: %v", codes)
+	}
+}
+
+func TestExtractSellerTax(t *testing.T) {
+	// 1. Modern totalTaxAmountV2
+	b1 := []byte(`{"sellerProposal": {"tax": {"totalTaxAmountV2": {"amount": "4.50", "currencyCode": "CAD"}}}}`)
+	amt, cur, fresh := extractSellerTax(fastExtract(b1, "sellerProposal"))
+	if !fresh || amt != "4.50" || cur != "CAD" {
+		t.Errorf("v2 tax extraction failed: amt=%s cur=%s fresh=%v", amt, cur, fresh)
+	}
+
+	// 2. totalTaxAmount value
+	b2 := []byte(`{"sellerProposal": {"tax": {"totalTaxAmount": {"value": {"amount": "1.25", "currencyCode": "USD"}}}}}`)
+	amt, cur, fresh = extractSellerTax(fastExtract(b2, "sellerProposal"))
+	if !fresh || amt != "1.25" || cur != "USD" {
+		t.Errorf("tta value tax extraction failed: amt=%s cur=%s fresh=%v", amt, cur, fresh)
+	}
+
+	// 3. Null / empty tax
+	b3 := []byte(`{"sellerProposal": {"tax": {"totalTaxAmount": null}}}`)
+	amt, cur, fresh = extractSellerTax(fastExtract(b3, "sellerProposal"))
+	if fresh || amt != "" {
+		t.Errorf("null tax should not be fresh: amt=%s fresh=%v", amt, fresh)
+	}
+}
+
+func TestSetSubmitDueAt(t *testing.T) {
+	sv := map[string]interface{}{
+		"input": map[string]interface{}{
+			"payment": map[string]interface{}{
+				"paymentLines": []map[string]interface{}{{
+					"dueAt": nil,
+				}},
+			},
+		},
+	}
+	setSubmitDueAt(sv, "2026-10-31T00:00:00Z")
+	lines := sv["input"].(map[string]interface{})["payment"].(map[string]interface{})["paymentLines"].([]map[string]interface{})
+	if lines[0]["dueAt"] != "2026-10-31T00:00:00Z" {
+		t.Errorf("expected dueAt to be set, got: %v", lines[0]["dueAt"])
+	}
+}
+
+func TestLowestAmountVariantPicker(t *testing.T) {
+	// Case 1: Pure lowest in 0.01 to 20.00 range ($0.05 vs $1.50 vs $15.00)
+	data := []byte(`{
+		"products": [
+			{"variants": [{"id": 101, "price": "15.00", "requires_shipping": true}]},
+			{"variants": [{"id": 102, "price": "1.50", "requires_shipping": true}]},
+			{"variants": [{"id": 103, "price": "0.05", "requires_shipping": true}]}
+		]
+	}`)
+	id, price, ship, ok := pickREST(data)
+	if !ok || id != "103" || price != 0.05 || !ship {
+		t.Errorf("expected variant 103 ($0.05 lowest), got id=%s price=%f ship=%v", id, price, ship)
+	}
+
+	// Case 2: Tied price ($1.00) prefers physical goods
+	dataTie := []byte(`{
+		"products": [
+			{"variants": [{"id": 201, "price": "1.00", "requires_shipping": false}]},
+			{"variants": [{"id": 202, "price": "1.00", "requires_shipping": true}]}
+		]
+	}`)
+	id, price, ship, ok = pickREST(dataTie)
+	if !ok || id != "202" || price != 1.00 || !ship {
+		t.Errorf("expected variant 202 (shipping preferred on tie), got id=%s price=%f ship=%v", id, price, ship)
+	}
+
+	// Case 3: Store has ONLY items over $20 (not more than it). Must be rejected!
+	dataOver20 := []byte(`{
+		"products": [
+			{"variants": [{"id": 301, "price": "25.00", "requires_shipping": true}]},
+			{"variants": [{"id": 302, "price": "60.00", "requires_shipping": false}]}
+		]
+	}`)
+	_, _, _, ok = pickREST(dataOver20)
+	if ok {
+		t.Errorf("expected variants > $20 to be rejected")
+	}
+
+	// Case 4: Free ($0.00) items must be skipped
+	dataFree := []byte(`{
+		"products": [
+			{"variants": [{"id": 401, "price": "0.00", "requires_shipping": false}]},
+			{"variants": [{"id": 402, "price": "0.50", "requires_shipping": true}]}
+		]
+	}`)
+	id, price, ship, ok = pickREST(dataFree)
+	if !ok || id != "402" || price != 0.50 || !ship {
+		t.Errorf("expected variant 402 ($0.50, skipping $0.00 free item), got id=%s price=%f ship=%v", id, price, ship)
+	}
+}
+

