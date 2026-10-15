@@ -4,18 +4,11 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-# Install build dependencies & ca-certificates
-RUN apk add --no-cache ca-certificates git
+# Copy source code and vendored dependencies
+COPY . ./
 
-# Cache modules
-COPY go.mod go.sum ./
-RUN go mod download
-
-# Copy source code
-COPY *.go ./
-
-# Compile statically linked binary with stripped debug symbols
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o shopapi .
+# Compile statically linked binary using pre-vendored dependencies (no network required)
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o shopapi .
 
 # Stage 2: Minimal runtime image
 FROM alpine:latest
