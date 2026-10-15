@@ -4548,7 +4548,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // BUILD_VERSION bumps on every shipped change. Surfaced on / and
 // /status so operators verify a deploy took (receipt support etc).
-const BUILD_VERSION = "v33.0 cheapest-variant engine"
+const BUILD_VERSION = "v33.1 cheapest-variant engine"
 const RECEIPT_SUPPORT = true
 
 func main() {
